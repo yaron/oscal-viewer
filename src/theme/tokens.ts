@@ -118,7 +118,6 @@ export const oscalModels: OscalModel[] = [
     path: "/assessment-results",
     description: "Captures the results of a security control assessment.",
     color: colors.orange,
-    disabled: true,
   },
   {
     key: "poam",
