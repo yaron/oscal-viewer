@@ -1,0 +1,87 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   Global Styles — Easy Dynamics Brand
+   Imported once in main.tsx; every page inherits these styles.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap');
+
+/* ── Reset ── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* ── Root / Body ── */
+:root {
+  font-family: 'Roboto', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-weight: 400;
+  line-height: 1.5;
+  color: #1C2327;
+  background-color: #F4F5F7;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+/* ── Typography ── */
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Roboto', sans-serif;
+  font-weight: 700;
+  color: #002868;
+  line-height: 1.25;
+}
+
+h1 { font-size: 2rem; }
+h2 { font-size: 1.5rem; }
+h3 { font-size: 1.25rem; }
+h4 { font-size: 1.1rem; }
+
+p {
+  font-size: 0.938rem;
+  line-height: 1.75;
+}
+
+a {
+  color: #02317F;
+  text-decoration: none;
+  font-weight: 500;
+}
+a:hover {
+  color: #FF6600;
+}
+
+code, pre {
+  font-family: 'Roboto Mono', 'Consolas', 'Courier New', monospace;
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #CFCED3; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9B9DAA; }
+
+/* ── Buttons ── */
+button {
+  font-family: inherit;
+  cursor: pointer;
+  border: none;
+  border-radius: 6px;
+  transition: filter 0.15s, box-shadow 0.15s;
+}
+button:hover {
+  filter: brightness(1.05);
+}
+button:focus-visible {
+  outline: 2px solid #FF6600;
+  outline-offset: 2px;
+}
