@@ -60,12 +60,76 @@ interface Observation {
   uuid: string;
   title: string;
   description: string;
-  collected: string;
+  collected?: string;
   methods: string[];
   types?: string[];
+  subjects?: { "subject-uuid"?: string; type?: string }[];
   props?: OscalProp[];
   links?: Link[];
+  remarks?: string;
   "relevant-evidence"?: { href: string; description?: string }[];
+}
+
+interface FindingTarget {
+  type: string;
+  "target-id": string;
+  status: { state: string; reason?: string };
+  "implementation-status"?: { state: string };
+  props?: OscalProp[];
+}
+
+interface Finding {
+  uuid: string;
+  title?: string;
+  description?: string;
+  target: FindingTarget;
+  "implementation-statement-uuid"?: string;
+  "related-observations"?: { "observation-uuid": string }[];
+  "associated-risks"?: { "risk-uuid": string }[];
+  remarks?: string;
+  props?: OscalProp[];
+  links?: Link[];
+}
+
+interface RiskFacet {
+  name: string;
+  system: string;
+  value: string;
+  props?: OscalProp[];
+}
+
+interface RiskCharacterization {
+  origin?: { type?: string; actors?: { type: string; "actor-uuid": string }[] };
+  facets: RiskFacet[];
+}
+
+interface Remediation {
+  uuid: string;
+  lifecycle: string;
+  title: string;
+  description: string;
+  props?: OscalProp[];
+  tasks?: {
+    uuid: string;
+    type: string;
+    title: string;
+    description: string;
+    timing?: { "within-date-range"?: { start: string; end: string } };
+  }[];
+}
+
+interface Risk {
+  uuid: string;
+  title: string;
+  description: string;
+  statement?: string;
+  status: string;
+  characterizations?: RiskCharacterization[];
+  "mitigating-factors"?: { uuid: string; description: string; "implementation-uuid"?: string }[];
+  remediations?: Remediation[];
+  deadline?: string;
+  props?: OscalProp[];
+  links?: Link[];
 }
 
 interface ReviewedControls {
@@ -83,6 +147,8 @@ interface Result {
   start: string;
   end?: string;
   observations?: Observation[];
+  findings?: Finding[];
+  risks?: Risk[];
   "reviewed-controls"?: ReviewedControls;
   props?: OscalProp[];
 }
@@ -127,6 +193,30 @@ const CRITICALITY_COLORS: Record<string, { bg: string; fg: string }> = {
   "Should/Not-Implemented":             { bg: alpha(colors.orange, 8), fg: colors.orange },
   May:                                  { bg: alpha(colors.cobalt, 8), fg: colors.cobalt },
   "-":                                  { bg: colors.bg, fg: colors.gray },
+};
+
+/** Finding target state colors */
+const FINDING_STATE_COLORS: Record<string, { bg: string; fg: string; border: string; label: string }> = {
+  satisfied:      { bg: colors.statusPassBg, fg: colors.statusPassFg, border: colors.statusPassBorder, label: "Satisfied" },
+  "not-satisfied": { bg: colors.statusFailBg, fg: colors.statusFailFg, border: colors.statusFailBorder, label: "Not Satisfied" },
+};
+
+/** Risk level severity colors (for facets such as likelihood, impact, risk) */
+const RISK_LEVEL_COLORS: Record<string, { bg: string; fg: string; border: string }> = {
+  low:      { bg: colors.statusPassBg, fg: colors.statusPassFg, border: colors.statusPassBorder },
+  moderate: { bg: colors.statusErrorBg, fg: colors.statusErrorFg, border: colors.statusErrorBorder },
+  high:     { bg: colors.statusFailBg, fg: colors.statusFailFg, border: colors.statusFailBorder },
+  critical: { bg: "#4a0010", fg: "#ff1744", border: "#d50000" },
+};
+
+/** Risk status colors */
+const RISK_STATUS_COLORS: Record<string, { bg: string; fg: string; border: string }> = {
+  open:                    { bg: colors.statusFailBg, fg: colors.statusFailFg, border: colors.statusFailBorder },
+  investigating:           { bg: colors.statusErrorBg, fg: colors.statusErrorFg, border: colors.statusErrorBorder },
+  remediating:             { bg: colors.statusErrorBg, fg: colors.statusErrorFg, border: colors.statusErrorBorder },
+  "deviation-requested":   { bg: colors.statusNaBg, fg: colors.statusNaFg, border: colors.statusNaBorder },
+  "deviation-approved":    { bg: alpha(colors.cobalt, 8), fg: colors.cobalt, border: colors.cobalt },
+  closed:                  { bg: colors.statusPassBg, fg: colors.statusPassFg, border: colors.statusPassBorder },
 };
 
 function fmtDate(s?: string) {
@@ -186,6 +276,15 @@ function getBaselineRef(obs: Observation): string {
   return getProp(obs.props, "baseline-reference") || "";
 }
 
+/** Extract NIST SP 800-53 control IDs from free text (e.g. remarks). Matches patterns like AC-2, AC-2(12), CM-6(a), SC-7(10)(a) */
+const NIST_CONTROL_RE = /\b([A-Z]{2}-\d+(?:\(\d+\))?(?:\([a-z]\))?)\b/g;
+function extractNistControls(text: string | undefined): string[] {
+  if (!text) return [];
+  const ids = new Set<string>();
+  for (const m of text.matchAll(NIST_CONTROL_RE)) ids.add(m[1]);
+  return [...ids].sort();
+}
+
 /** Try to extract the test ID number from the title for a sort key */
 function getSortKey(title: string): string {
   const m = title.match(/MS\.(\w+)\.(\d+)\.(\d+)/);
@@ -193,6 +292,43 @@ function getSortKey(title: string): string {
     return `${m[1]}.${m[2].padStart(3, "0")}.${m[3].padStart(3, "0")}`;
   }
   return title;
+}
+
+/** Get the primary risk level from a Risk's characterizations (looks for "risk" or "likelihood" facet) */
+function getRiskLevel(risk: Risk): string {
+  for (const ch of risk.characterizations ?? []) {
+    for (const f of ch.facets) {
+      if (f.name === "risk" || f.name === "risk-level") return f.value.toLowerCase();
+    }
+  }
+  // Fallback to likelihood
+  for (const ch of risk.characterizations ?? []) {
+    for (const f of ch.facets) {
+      if (f.name === "likelihood") return f.value.toLowerCase();
+    }
+  }
+  return "unknown";
+}
+
+/** Get all facets from a Risk's characterizations */
+function getRiskFacets(risk: Risk): RiskFacet[] {
+  const facets: RiskFacet[] = [];
+  for (const ch of risk.characterizations ?? []) {
+    facets.push(...ch.facets);
+  }
+  return facets;
+}
+
+/** Sort key for risk severity: critical > high > moderate > low */
+function riskSeveritySortKey(risk: Risk): number {
+  const level = getRiskLevel(risk);
+  switch (level) {
+    case "critical": return 0;
+    case "high":     return 1;
+    case "moderate": return 2;
+    case "low":      return 3;
+    default:         return 4;
+  }
 }
 
 /* ── Catalog lookup helpers ── */
@@ -324,6 +460,24 @@ function IcoExternalLink({ size = 14, style }: IconProps) {
 function IcoBook({ size = 16, style }: IconProps) {
   return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 19.5A2.5 2.5 0 016.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z" /></svg>;
 }
+function IcoTarget({ size = 16, style }: IconProps) {
+  return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><circle cx="12" cy="12" r="6" /><circle cx="12" cy="12" r="2" /></svg>;
+}
+function IcoAlertTriangle({ size = 16, style }: IconProps) {
+  return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>;
+}
+function IcoTool({ size = 16, style }: IconProps) {
+  return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z" /></svg>;
+}
+function IcoCheckCircle({ size = 16, style }: IconProps) {
+  return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>;
+}
+function IcoXCircle({ size = 16, style }: IconProps) {
+  return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" /></svg>;
+}
+function IcoEye({ size = 16, style }: IconProps) {
+  return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" /></svg>;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
    MAIN PAGE COMPONENT
@@ -429,10 +583,105 @@ export default function AssessmentResultsPage() {
     return counts;
   }, [allObservations]);
 
+  /* ── Aggregate all findings from all results ── */
+  const allFindings = useMemo(() => {
+    if (!ar) return [];
+    return ar.results.flatMap((r) => (r.findings ?? []).filter((f) => f.uuid && f.target));
+  }, [ar]);
+
+  /* ── Aggregate all risks from all results ── */
+  const allRisks = useMemo(() => {
+    if (!ar) return [];
+    return ar.results.flatMap((r) => (r.risks ?? []).filter((rk) => rk.uuid));
+  }, [ar]);
+
+  /** Finding state counts */
+  const findingStateCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    allFindings.forEach((f) => {
+      const state = f.target.status.state;
+      counts[state] = (counts[state] ?? 0) + 1;
+    });
+    return counts;
+  }, [allFindings]);
+
+  /** Risk level counts */
+  const riskLevelCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    allRisks.forEach((r) => {
+      const level = getRiskLevel(r);
+      counts[level] = (counts[level] ?? 0) + 1;
+    });
+    return counts;
+  }, [allRisks]);
+
+  /** Risk status counts */
+  const riskStatusCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    allRisks.forEach((r) => {
+      counts[r.status] = (counts[r.status] ?? 0) + 1;
+    });
+    return counts;
+  }, [allRisks]);
+
+  /** Observation lookup map by uuid */
+  const obsMap = useMemo(() => {
+    const m: Record<string, Observation> = {};
+    allObservations.forEach((o) => { m[o.uuid] = o; });
+    return m;
+  }, [allObservations]);
+
+  /** Risk lookup map by uuid */
+  const riskMap = useMemo(() => {
+    const m: Record<string, Risk> = {};
+    allRisks.forEach((r) => { m[r.uuid] = r; });
+    return m;
+  }, [allRisks]);
+
+  /** NIST control IDs extracted from observation remarks */
+  const obsNistMap = useMemo(() => {
+    const m: Record<string, string[]> = {};
+    allObservations.forEach((o) => {
+      const ids = extractNistControls(o.remarks);
+      if (ids.length) m[o.uuid] = ids;
+    });
+    return m;
+  }, [allObservations]);
+
+  /** NIST control IDs for each finding (aggregated from its related observations) */
+  const findingNistMap = useMemo(() => {
+    const m: Record<string, string[]> = {};
+    allFindings.forEach((f) => {
+      const ids = new Set<string>();
+      (f["related-observations"] ?? []).forEach((ro) => {
+        (obsNistMap[ro["observation-uuid"]] ?? []).forEach((id) => ids.add(id));
+      });
+      if (ids.size) m[f.uuid] = [...ids].sort();
+    });
+    return m;
+  }, [allFindings, obsNistMap]);
+
+  /** NIST control IDs for each risk (aggregated from findings that reference it) */
+  const riskNistMap = useMemo(() => {
+    const m: Record<string, string[]> = {};
+    allFindings.forEach((f) => {
+      const fNist = findingNistMap[f.uuid] ?? [];
+      if (!fNist.length) return;
+      (f["associated-risks"] ?? []).forEach((ar) => {
+        const prev = m[ar["risk-uuid"]] ?? [];
+        const merged = new Set([...prev, ...fNist]);
+        m[ar["risk-uuid"]] = [...merged].sort();
+      });
+    });
+    return m;
+  }, [allFindings, findingNistMap]);
+
   /* ── Default collapsed state ── */
   const defaultCollapsed = useMemo(() => {
     const dc: Record<string, boolean> = {};
     groupNames.forEach((g) => { dc[`group-${g}`] = true; });
+    dc["findings-section"] = true;
+    dc["risks-section"] = true;
     ar?.results.forEach((_r, i) => {
       if (ar.results.length > 1) dc[`result-${i}`] = true;
     });
@@ -555,6 +804,83 @@ export default function AssessmentResultsPage() {
               );
             })
           )}
+
+          {/* Findings section */}
+          {allFindings.length > 0 && (() => {
+            const isCollapsed = !!mergedCollapsed["findings-section"];
+            return (
+              <>
+                <NavRow
+                  id="findings-section"
+                  label={`Findings (${allFindings.length})`}
+                  icon={<IcoTarget size={14} style={{ color: colors.darkGreen }} />}
+                  active={view === "findings"}
+                  onClick={() => navigate("findings")}
+                  depth={0}
+                  badge={allFindings.length}
+                  hasChildren
+                  expanded={!isCollapsed}
+                  onToggle={() => toggleGroup("findings-section")}
+                />
+                {!isCollapsed && allFindings.map((f) => {
+                  const state = f.target.status.state;
+                  const sc = FINDING_STATE_COLORS[state];
+                  return (
+                    <NavRow
+                      key={f.uuid}
+                      id={`finding-${f.uuid}`}
+                      label={f.target["target-id"].toUpperCase()}
+                      icon={state === "satisfied"
+                        ? <IcoCheckCircle size={12} style={{ color: colors.statusPassFg }} />
+                        : <IcoXCircle size={12} style={{ color: colors.statusFailFg }} />}
+                      active={view === `finding-${f.uuid}`}
+                      onClick={() => navigate(`finding-${f.uuid}`)}
+                      depth={1}
+                      statusColor={sc?.border}
+                    />
+                  );
+                })}
+              </>
+            );
+          })()}
+
+          {/* Risks section */}
+          {allRisks.length > 0 && (() => {
+            const isCollapsed = !!mergedCollapsed["risks-section"];
+            const sorted = [...allRisks].sort((a, b) => riskSeveritySortKey(a) - riskSeveritySortKey(b));
+            return (
+              <>
+                <NavRow
+                  id="risks-section"
+                  label={`Risks (${allRisks.length})`}
+                  icon={<IcoAlertTriangle size={14} style={{ color: colors.red }} />}
+                  active={view === "risks"}
+                  onClick={() => navigate("risks")}
+                  depth={0}
+                  badge={allRisks.length}
+                  hasChildren
+                  expanded={!isCollapsed}
+                  onToggle={() => toggleGroup("risks-section")}
+                />
+                {!isCollapsed && sorted.map((r) => {
+                  const level = getRiskLevel(r);
+                  const rc = RISK_LEVEL_COLORS[level];
+                  return (
+                    <NavRow
+                      key={r.uuid}
+                      id={`risk-${r.uuid}`}
+                      label={trunc(r.title, 32)}
+                      icon={<IcoAlertTriangle size={12} style={{ color: rc?.fg ?? colors.gray }} />}
+                      active={view === `risk-${r.uuid}`}
+                      onClick={() => navigate(`risk-${r.uuid}`)}
+                      depth={1}
+                      statusColor={rc?.border}
+                    />
+                  );
+                })}
+              </>
+            );
+          })()}
         </nav>
 
         {/* ── CONTENT PANEL ── */}
@@ -564,9 +890,19 @@ export default function AssessmentResultsPage() {
             ar={ar}
             navigate={navigate}
             allObservations={allObservations}
+            allFindings={allFindings}
+            allRisks={allRisks}
+            obsMap={obsMap}
+            riskMap={riskMap}
+            obsNistMap={obsNistMap}
+            findingNistMap={findingNistMap}
+            riskNistMap={riskNistMap}
             groupedObservations={groupedObservations}
             groupNames={groupNames}
             statusCounts={statusCounts}
+            findingStateCounts={findingStateCounts}
+            riskLevelCounts={riskLevelCounts}
+            riskStatusCounts={riskStatusCounts}
             statusFilter={statusFilter}
             catalog={catalog}
           />
@@ -778,18 +1114,50 @@ interface ViewRouterProps {
   ar: AssessmentResults;
   navigate: (id: string) => void;
   allObservations: Observation[];
+  allFindings: Finding[];
+  allRisks: Risk[];
+  obsMap: Record<string, Observation>;
+  riskMap: Record<string, Risk>;
+  obsNistMap: Record<string, string[]>;
+  findingNistMap: Record<string, string[]>;
+  riskNistMap: Record<string, string[]>;
   groupedObservations: Record<string, Observation[]>;
   groupNames: string[];
   statusCounts: Record<string, number>;
+  findingStateCounts: Record<string, number>;
+  riskLevelCounts: Record<string, number>;
+  riskStatusCounts: Record<string, number>;
   statusFilter: string;
   catalog: OscalCatalog | null;
 }
 
-function ViewRouter({ view, ar, navigate, allObservations, groupedObservations, groupNames, statusCounts, statusFilter, catalog }: ViewRouterProps) {
+function ViewRouter({ view, ar, navigate, allObservations, allFindings, allRisks, obsMap, riskMap, obsNistMap, findingNistMap, riskNistMap, groupedObservations, groupNames, statusCounts, findingStateCounts, riskLevelCounts, riskStatusCounts, statusFilter, catalog }: ViewRouterProps) {
   if (view === "overview")
-    return <OverviewView ar={ar} navigate={navigate} allObservations={allObservations} groupedObservations={groupedObservations} groupNames={groupNames} statusCounts={statusCounts} />;
+    return <OverviewView ar={ar} navigate={navigate} allObservations={allObservations} allFindings={allFindings} allRisks={allRisks} groupedObservations={groupedObservations} groupNames={groupNames} statusCounts={statusCounts} findingStateCounts={findingStateCounts} riskLevelCounts={riskLevelCounts} riskStatusCounts={riskStatusCounts} />;
   if (view === "metadata")
     return <MetadataView ar={ar} navigate={navigate} />;
+
+  // findings list
+  if (view === "findings")
+    return <FindingsListView findings={allFindings} navigate={navigate} obsMap={obsMap} riskMap={riskMap} findingNistMap={findingNistMap} />;
+
+  // risks list
+  if (view === "risks")
+    return <RisksListView risks={allRisks} navigate={navigate} riskLevelCounts={riskLevelCounts} riskStatusCounts={riskStatusCounts} riskNistMap={riskNistMap} />;
+
+  // finding-<uuid>
+  if (view.startsWith("finding-")) {
+    const uuid = view.slice(8);
+    const finding = allFindings.find((f) => f.uuid === uuid);
+    if (finding) return <FindingDetailView finding={finding} navigate={navigate} obsMap={obsMap} riskMap={riskMap} findingNistMap={findingNistMap} obsNistMap={obsNistMap} />;
+  }
+
+  // risk-<uuid>
+  if (view.startsWith("risk-")) {
+    const uuid = view.slice(5);
+    const risk = allRisks.find((r) => r.uuid === uuid);
+    if (risk) return <RiskDetailView risk={risk} navigate={navigate} allFindings={allFindings} riskNistMap={riskNistMap} />;
+  }
 
   // result-N
   const resultMatch = view.match(/^result-(\d+)$/);
@@ -803,14 +1171,14 @@ function ViewRouter({ view, ar, navigate, allObservations, groupedObservations, 
   if (view.startsWith("group-")) {
     const groupName = view.replace("group-", "");
     const observations = groupedObservations[groupName];
-    if (observations) return <GroupView groupName={groupName} observations={observations} navigate={navigate} statusFilter={statusFilter} catalog={catalog} />;
+    if (observations) return <GroupView groupName={groupName} observations={observations} navigate={navigate} statusFilter={statusFilter} catalog={catalog} obsNistMap={obsNistMap} />;
   }
 
   // obs-<uuid>
   if (view.startsWith("obs-")) {
     const uuid = view.slice(4);
     const obs = allObservations.find((o) => o.uuid === uuid);
-    if (obs) return <ObservationView obs={obs} navigate={navigate} catalog={catalog} />;
+    if (obs) return <ObservationView obs={obs} navigate={navigate} catalog={catalog} nistControls={obsNistMap[uuid] ?? []} />;
   }
 
   return <NotFoundView navigate={navigate} />;
@@ -875,6 +1243,47 @@ function PropPill({ name, value }: { name: string; value: string }) {
   );
 }
 
+/** Render NIST SP 800-53 control ID chips — prominent navy pills */
+function NistChips({ controls }: { controls: string[] }) {
+  if (!controls.length) return null;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+      {controls.map((id) => (
+        <span key={id} style={{
+          display: "inline-flex", alignItems: "center", gap: 3,
+          fontSize: 10, fontWeight: 700, fontFamily: fonts.mono,
+          padding: "2px 7px", borderRadius: radii.pill,
+          backgroundColor: alpha(colors.navy, 10), color: colors.navy,
+          border: `1px solid ${alpha(colors.navy, 25)}`,
+          letterSpacing: 0.3, whiteSpace: "nowrap",
+        }}>
+          {id}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** Inline row of NIST chips with a tiny label, for use in list/table rows */
+function NistChipsInline({ controls }: { controls: string[] }) {
+  if (!controls.length) return null;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 3, marginTop: 3 }}>
+      {controls.map((id) => (
+        <span key={id} style={{
+          fontSize: 9, fontWeight: 700, fontFamily: fonts.mono,
+          padding: "1px 5px", borderRadius: radii.pill,
+          backgroundColor: alpha(colors.navy, 8), color: colors.navy,
+          border: `1px solid ${alpha(colors.navy, 18)}`,
+          whiteSpace: "nowrap",
+        }}>
+          {id}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
    DROP ZONE
    ═══════════════════════════════════════════════════════════════════════════ */
@@ -925,13 +1334,18 @@ function DropZone({ onFile, error }: { onFile: (f: File) => void; error: string 
    OVERVIEW VIEW — dashboard with stats and quick navigation
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function OverviewView({ ar, navigate, allObservations, groupedObservations, groupNames, statusCounts }: {
+function OverviewView({ ar, navigate, allObservations, allFindings, allRisks, groupedObservations, groupNames, statusCounts, findingStateCounts, riskLevelCounts, riskStatusCounts }: {
   ar: AssessmentResults;
   navigate: (id: string) => void;
   allObservations: Observation[];
+  allFindings: Finding[];
+  allRisks: Risk[];
   groupedObservations: Record<string, Observation[]>;
   groupNames: string[];
   statusCounts: Record<string, number>;
+  findingStateCounts: Record<string, number>;
+  riskLevelCounts: Record<string, number>;
+  riskStatusCounts: Record<string, number>;
 }) {
   const result = ar.results[0];
 
@@ -949,69 +1363,150 @@ function OverviewView({ ar, navigate, allObservations, groupedObservations, grou
 
       {/* Stat Cards */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 12, marginBottom: 20 }}>
-        <StatCard label="Results" value={ar.results.length} color={colors.navy} />
-        <StatCard label="Total Observations" value={allObservations.length} color={colors.cobalt} />
-        <StatCard label="Control Groups" value={groupNames.length} color={colors.brightBlue} />
-        {result && <StatCard label="Assessment Time" value={fmtDateTime(result.start)} color={colors.darkGreen} small />}
+        <StatCard label="Observations" value={allObservations.length} color={colors.cobalt} />
+        <StatCard label="Findings" value={allFindings.length} color={colors.darkGreen} onClick={() => allFindings.length > 0 && navigate("findings")} />
+        <StatCard label="Risks" value={allRisks.length} color={colors.red} onClick={() => allRisks.length > 0 && navigate("risks")} />
+        {result && <StatCard label="Assessment Period" value={`${fmtDate(result.start)} — ${fmtDate(result.end)}`} color={colors.navy} small />}
       </div>
 
-      {/* Status Summary */}
-      <Card>
-        <SectionLabel>Status Summary</SectionLabel>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
-          {Object.entries(statusCounts).sort(([a], [b]) => a.localeCompare(b)).map(([status, count]) => {
-            const sc = STATUS_COLORS[status] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
-            return (
-              <div
-                key={status}
-                style={{
-                  display: "flex", alignItems: "center", gap: 10, padding: "10px 16px",
-                  borderRadius: radii.md, backgroundColor: sc.bg, border: `1px solid ${sc.border}`,
-                  minWidth: 120,
-                }}
-              >
-                <span style={{ fontSize: 22, fontWeight: 800, color: sc.fg }}>{count}</span>
-                <span style={{ fontSize: 12, fontWeight: 600, color: sc.fg }}>{status}</span>
-              </div>
-            );
-          })}
-        </div>
-      </Card>
+      {/* Findings Summary */}
+      {allFindings.length > 0 && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <SectionLabel>Findings Summary</SectionLabel>
+            <span onClick={() => navigate("findings")} style={{ fontSize: 11, color: colors.brightBlue, cursor: "pointer", fontWeight: 600 }}>View All →</span>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+            {Object.entries(findingStateCounts).map(([state, count]) => {
+              const fc = FINDING_STATE_COLORS[state] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray, label: state };
+              return (
+                <div
+                  key={state}
+                  onClick={() => navigate("findings")}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: "10px 16px",
+                    borderRadius: radii.md, backgroundColor: fc.bg, border: `1px solid ${fc.border}`,
+                    minWidth: 140, cursor: "pointer",
+                  }}
+                >
+                  {state === "satisfied"
+                    ? <IcoCheckCircle size={18} style={{ color: fc.fg }} />
+                    : <IcoXCircle size={18} style={{ color: fc.fg }} />}
+                  <span style={{ fontSize: 22, fontWeight: 800, color: fc.fg }}>{count}</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: fc.fg }}>{fc.label}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
 
-      {/* Control Groups Quick Nav */}
-      <Card>
-        <SectionLabel>Control Groups ({groupNames.length})</SectionLabel>
-        {groupNames.map((groupName) => {
-          const obs = groupedObservations[groupName];
-          const statuses: Record<string, number> = {};
-          obs.forEach((o) => { const s = getStatus(o); statuses[s] = (statuses[s] ?? 0) + 1; });
-
-          return (
-            <div
-              key={groupName}
-              onClick={() => navigate(`group-${groupName}`)}
-              style={{
-                display: "flex", alignItems: "center", gap: 12, padding: "10px 0",
-                borderBottom: `1px solid ${colors.bg}`, cursor: "pointer",
-              }}
-            >
-              <IcoFolder size={14} style={{ color: colors.cobalt }} />
-              <span style={{ fontSize: 13, fontWeight: 600, color: colors.navy, flex: 1 }}>{groupName}</span>
-              <div style={{ display: "flex", gap: 6 }}>
-                {Object.entries(statuses).map(([s, c]) => {
-                  const sc = STATUS_COLORS[s] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+      {/* Risks Summary */}
+      {allRisks.length > 0 && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+            <SectionLabel>Risks by Severity</SectionLabel>
+            <span onClick={() => navigate("risks")} style={{ fontSize: 11, color: colors.brightBlue, cursor: "pointer", fontWeight: 600 }}>View All →</span>
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 16 }}>
+            {["critical", "high", "moderate", "low"].filter((l) => riskLevelCounts[l]).map((level) => {
+              const rc = RISK_LEVEL_COLORS[level] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+              return (
+                <div
+                  key={level}
+                  onClick={() => navigate("risks")}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: "10px 16px",
+                    borderRadius: radii.md, backgroundColor: rc.bg, border: `1px solid ${rc.border}`,
+                    minWidth: 120, cursor: "pointer",
+                  }}
+                >
+                  <IcoAlertTriangle size={16} style={{ color: rc.fg }} />
+                  <span style={{ fontSize: 22, fontWeight: 800, color: rc.fg }}>{riskLevelCounts[level]}</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: rc.fg, textTransform: "capitalize" }}>{level}</span>
+                </div>
+              );
+            })}
+          </div>
+          {Object.keys(riskStatusCounts).length > 0 && (
+            <>
+              <SectionLabel>Risks by Status</SectionLabel>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {Object.entries(riskStatusCounts).map(([status, count]) => {
+                  const sc = RISK_STATUS_COLORS[status] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
                   return (
-                    <span key={s} style={{ fontSize: 10, fontWeight: 600, padding: "1px 6px", borderRadius: radii.pill, backgroundColor: sc.bg, color: sc.fg }}>
-                      {c} {s}
+                    <span key={status} style={{ fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: radii.pill, backgroundColor: sc.bg, color: sc.fg, border: `1px solid ${sc.border}` }}>
+                      {count} {status}
                     </span>
                   );
                 })}
               </div>
-              <span style={S.badge}>{obs.length}</span>
-            </div>
-          );
-        })}
-      </Card>
+            </>
+          )}
+        </Card>
+      )}
+
+      {/* Observation Status Summary */}
+      {allObservations.length > 0 && (
+        <Card>
+          <SectionLabel>Observation Status Summary</SectionLabel>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+            {Object.entries(statusCounts).sort(([a], [b]) => a.localeCompare(b)).map(([status, count]) => {
+              const sc = STATUS_COLORS[status] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+              return (
+                <div
+                  key={status}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 10, padding: "10px 16px",
+                    borderRadius: radii.md, backgroundColor: sc.bg, border: `1px solid ${sc.border}`,
+                    minWidth: 120,
+                  }}
+                >
+                  <span style={{ fontSize: 22, fontWeight: 800, color: sc.fg }}>{count}</span>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: sc.fg }}>{status}</span>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Control Groups Quick Nav */}
+      {groupNames.length > 0 && (
+        <Card>
+          <SectionLabel>Control Groups ({groupNames.length})</SectionLabel>
+          {groupNames.map((groupName) => {
+            const obs = groupedObservations[groupName];
+            const statuses: Record<string, number> = {};
+            obs.forEach((o) => { const s = getStatus(o); statuses[s] = (statuses[s] ?? 0) + 1; });
+
+            return (
+              <div
+                key={groupName}
+                onClick={() => navigate(`group-${groupName}`)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "10px 0",
+                  borderBottom: `1px solid ${colors.bg}`, cursor: "pointer",
+                }}
+              >
+                <IcoFolder size={14} style={{ color: colors.cobalt }} />
+                <span style={{ fontSize: 13, fontWeight: 600, color: colors.navy, flex: 1 }}>{groupName}</span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  {Object.entries(statuses).map(([s, c]) => {
+                    const sc = STATUS_COLORS[s] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+                    return (
+                      <span key={s} style={{ fontSize: 10, fontWeight: 600, padding: "1px 6px", borderRadius: radii.pill, backgroundColor: sc.bg, color: sc.fg }}>
+                        {c} {s}
+                      </span>
+                    );
+                  })}
+                </div>
+                <span style={S.badge}>{obs.length}</span>
+              </div>
+            );
+          })}
+        </Card>
+      )}
 
       {/* Results list (if multiple) */}
       {ar.results.length > 1 && (
@@ -1043,11 +1538,13 @@ function OverviewView({ ar, navigate, allObservations, groupedObservations, grou
    STAT CARD
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function StatCard({ label, value, color, small }: { label: string; value: string | number; color: string; small?: boolean }) {
+function StatCard({ label, value, color, small, onClick }: { label: string; value: string | number; color: string; small?: boolean; onClick?: () => void }) {
   return (
-    <Card style={{ borderTop: `3px solid ${color}`, padding: "14px 16px" }}>
-      <div style={{ fontSize: 11, fontWeight: 600, color: colors.gray, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
-      <div style={{ fontSize: small ? 13 : 22, fontWeight: 700, color }}>{value}</div>
+    <Card style={{ borderTop: `3px solid ${color}`, padding: "14px 16px", cursor: onClick ? "pointer" : "default" }}>
+      <div onClick={onClick} style={{ cursor: onClick ? "pointer" : "default" }}>
+        <div style={{ fontSize: 11, fontWeight: 600, color: colors.gray, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 }}>{label}</div>
+        <div style={{ fontSize: small ? 13 : 22, fontWeight: 700, color }}>{value}</div>
+      </div>
     </Card>
   );
 }
@@ -1198,12 +1695,19 @@ function ResultView({ result, resultIdx, navigate, catalog }: {
    GROUP VIEW — control group with observations
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function GroupView({ groupName, observations, navigate, statusFilter, catalog }: {
-  groupName: string; observations: Observation[]; navigate: (id: string) => void; statusFilter: string; catalog: OscalCatalog | null;
+function GroupView({ groupName, observations, navigate, statusFilter, catalog, obsNistMap }: {
+  groupName: string; observations: Observation[]; navigate: (id: string) => void; statusFilter: string; catalog: OscalCatalog | null; obsNistMap: Record<string, string[]>;
 }) {
   const visible = statusFilter === "all" ? observations : observations.filter((o) => getStatus(o) === statusFilter);
   const statusCounts: Record<string, number> = {};
   observations.forEach((o) => { const s = getStatus(o); statusCounts[s] = (statusCounts[s] ?? 0) + 1; });
+
+  // Aggregate NIST controls across all observations in this group
+  const groupNist = useMemo(() => {
+    const ids = new Set<string>();
+    observations.forEach((o) => (obsNistMap[o.uuid] ?? []).forEach((id) => ids.add(id)));
+    return [...ids].sort();
+  }, [observations, obsNistMap]);
 
   return (
     <div>
@@ -1215,6 +1719,14 @@ function GroupView({ groupName, observations, navigate, statusFilter, catalog }:
       <div style={{ fontSize: 12, color: colors.gray, marginBottom: 16 }}>
         {observations.length} observation{observations.length !== 1 ? "s" : ""} in this control group
       </div>
+
+      {/* NIST Controls for this group */}
+      {groupNist.length > 0 && (
+        <Card>
+          <SectionLabel>NIST SP 800-53 Controls ({groupNist.length})</SectionLabel>
+          <NistChips controls={groupNist} />
+        </Card>
+      )}
 
       {/* Status Summary */}
       <Card>
@@ -1232,7 +1744,7 @@ function GroupView({ groupName, observations, navigate, statusFilter, catalog }:
       {/* Observations table */}
       <Card>
         <SectionLabel>Observations ({visible.length}{statusFilter !== "all" ? ` — filtered by ${statusFilter}` : ""})</SectionLabel>
-        <ObservationTable observations={visible} navigate={navigate} catalog={catalog} />
+        <ObservationTable observations={visible} navigate={navigate} catalog={catalog} obsNistMap={obsNistMap} />
       </Card>
     </div>
   );
@@ -1242,8 +1754,8 @@ function GroupView({ groupName, observations, navigate, statusFilter, catalog }:
    OBSERVATION TABLE — list of observations with status, criticality, nav
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function ObservationTable({ observations, navigate }: {
-  observations: Observation[]; navigate: (id: string) => void; catalog: OscalCatalog | null;
+function ObservationTable({ observations, navigate, obsNistMap }: {
+  observations: Observation[]; navigate: (id: string) => void; catalog: OscalCatalog | null; obsNistMap?: Record<string, string[]>;
 }) {
   if (observations.length === 0) {
     return <div style={{ fontSize: 13, color: colors.gray, fontStyle: "italic" }}>No observations found.</div>;
@@ -1254,7 +1766,7 @@ function ObservationTable({ observations, navigate }: {
       {/* Header */}
       <div style={{
         display: "grid",
-        gridTemplateColumns: "minmax(300px, 2fr) 90px 120px 80px",
+        gridTemplateColumns: "minmax(280px, 2fr) 90px 120px minmax(120px, 1fr)",
         gap: 8,
         padding: "8px 0",
         borderBottom: `2px solid ${colors.paleGray}`,
@@ -1267,7 +1779,7 @@ function ObservationTable({ observations, navigate }: {
         <span>Observation</span>
         <span>Status</span>
         <span>Criticality</span>
-        <span>Collected</span>
+        <span>NIST Controls</span>
       </div>
 
       {/* Rows */}
@@ -1275,6 +1787,7 @@ function ObservationTable({ observations, navigate }: {
         const status = getStatus(obs);
         const criticality = getCriticality(obs);
         const sc = STATUS_COLORS[status] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+        const nist = obsNistMap?.[obs.uuid] ?? extractNistControls(obs.remarks);
 
         return (
           <div
@@ -1282,7 +1795,7 @@ function ObservationTable({ observations, navigate }: {
             onClick={() => navigate(`obs-${obs.uuid}`)}
             style={{
               display: "grid",
-              gridTemplateColumns: "minmax(300px, 2fr) 90px 120px 80px",
+              gridTemplateColumns: "minmax(280px, 2fr) 90px 120px minmax(120px, 1fr)",
               gap: 8,
               padding: "10px 0",
               borderBottom: `1px solid ${colors.bg}`,
@@ -1301,7 +1814,7 @@ function ObservationTable({ observations, navigate }: {
             </div>
             <StatusBadge status={status} />
             <CriticalityBadge criticality={criticality} />
-            <span style={{ fontSize: 11, color: colors.gray }}>{fmtDate(obs.collected)}</span>
+            <NistChipsInline controls={nist} />
           </div>
         );
       })}
@@ -1313,8 +1826,8 @@ function ObservationTable({ observations, navigate }: {
    OBSERVATION VIEW — full detail view for a single observation
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function ObservationView({ obs, navigate, catalog }: {
-  obs: Observation; navigate: (id: string) => void; catalog: OscalCatalog | null;
+function ObservationView({ obs, navigate, catalog, nistControls }: {
+  obs: Observation; navigate: (id: string) => void; catalog: OscalCatalog | null; nistControls: string[];
 }) {
   const status = getStatus(obs);
   const criticality = getCriticality(obs);
@@ -1341,6 +1854,14 @@ function ObservationView({ obs, navigate, catalog }: {
         <CriticalityBadge criticality={criticality} />
         <span style={{ fontSize: 11, color: colors.gray, fontFamily: fonts.mono }}>{obs.uuid}</span>
       </div>
+
+      {/* NIST Controls */}
+      {nistControls.length > 0 && (
+        <Card style={{ borderLeft: `4px solid ${colors.navy}` }}>
+          <SectionLabel>NIST SP 800-53 Controls</SectionLabel>
+          <NistChips controls={nistControls} />
+        </Card>
+      )}
 
       {/* Description */}
       <Card style={{ borderLeft: `4px solid ${sc.border}` }}>
@@ -1568,6 +2089,697 @@ function getAllCatalogControls(catalog: OscalCatalog): CatalogControl[] {
     (c.controls ?? []).forEach((enh) => result.push(enh));
   });
   return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FINDINGS LIST VIEW — tabular list of all findings with state
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function FindingsListView({ findings, navigate, obsMap, riskMap, findingNistMap }: {
+  findings: Finding[];
+  navigate: (id: string) => void;
+  obsMap: Record<string, Observation>;
+  riskMap: Record<string, Risk>;
+  findingNistMap: Record<string, string[]>;
+}) {
+  const sorted = useMemo(() => {
+    return [...findings].sort((a, b) => {
+      // Not-satisfied first, then by target-id
+      if (a.target.status.state !== b.target.status.state) {
+        return a.target.status.state === "not-satisfied" ? -1 : 1;
+      }
+      return a.target["target-id"].localeCompare(b.target["target-id"]);
+    });
+  }, [findings]);
+
+  return (
+    <div>
+      <Breadcrumbs items={[{ id: "overview", label: "Overview" }, { id: "findings", label: "Findings" }]} navigate={navigate} />
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+        <IcoTarget size={22} style={{ color: colors.darkGreen }} />
+        <h1 style={{ fontSize: 20, color: colors.navy, margin: 0 }}>Findings ({findings.length})</h1>
+      </div>
+      <div style={{ fontSize: 12, color: colors.gray, marginBottom: 16 }}>
+        Findings represent the judgement — whether each assessed control target is satisfied or not.
+      </div>
+
+      {/* Summary */}
+      <Card>
+        <SectionLabel>State Summary</SectionLabel>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+          {Object.entries(FINDING_STATE_COLORS).map(([state, fc]) => {
+            const count = sorted.filter((f) => f.target.status.state === state).length;
+            if (!count) return null;
+            return (
+              <div key={state} style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", borderRadius: radii.md, backgroundColor: fc.bg, border: `1px solid ${fc.border}` }}>
+                {state === "satisfied" ? <IcoCheckCircle size={16} style={{ color: fc.fg }} /> : <IcoXCircle size={16} style={{ color: fc.fg }} />}
+                <span style={{ fontSize: 20, fontWeight: 800, color: fc.fg }}>{count}</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: fc.fg }}>{fc.label}</span>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Findings table */}
+      <Card>
+        <div style={{ overflowX: "auto" }}>
+          {/* Header */}
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "minmax(140px, 1fr) 120px minmax(180px, 2fr) minmax(100px, 1fr) 90px 80px",
+            gap: 8,
+            padding: "8px 0",
+            borderBottom: `2px solid ${colors.paleGray}`,
+            fontSize: 10,
+            fontWeight: 700,
+            textTransform: "uppercase",
+            letterSpacing: 0.8,
+            color: colors.gray,
+          }}>
+            <span>Control Target</span>
+            <span>State</span>
+            <span>Title / Description</span>
+            <span>NIST Controls</span>
+            <span>Observations</span>
+            <span>Risks</span>
+          </div>
+
+          {/* Rows */}
+          {sorted.map((f) => {
+            const state = f.target.status.state;
+            const fc = FINDING_STATE_COLORS[state] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray, label: state };
+            const relObs = f["related-observations"] ?? [];
+            const assocRisks = f["associated-risks"] ?? [];
+
+            return (
+              <div
+                key={f.uuid}
+                onClick={() => navigate(`finding-${f.uuid}`)}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "minmax(140px, 1fr) 120px minmax(180px, 2fr) minmax(100px, 1fr) 90px 80px",
+                  gap: 8,
+                  padding: "10px 0",
+                  borderBottom: `1px solid ${colors.bg}`,
+                  cursor: "pointer",
+                  alignItems: "center",
+                  borderLeft: `3px solid ${fc.border}`,
+                  paddingLeft: 8,
+                }}
+              >
+                <span style={{ fontSize: 13, fontWeight: 700, fontFamily: fonts.mono, color: colors.navy }}>
+                  {f.target["target-id"].toUpperCase()}
+                </span>
+                <FindingStateBadge state={state} />
+                <div>
+                  {f.title && <div style={{ fontSize: 12, fontWeight: 600, color: colors.black }}>{f.title}</div>}
+                  {f.description && <div style={{ fontSize: 11, color: colors.gray }}>{trunc(f.description, 80)}</div>}
+                  {!f.title && !f.description && f.remarks && <div style={{ fontSize: 11, color: colors.gray }}>{trunc(f.remarks, 80)}</div>}
+                </div>
+                <NistChipsInline controls={findingNistMap?.[f.uuid] ?? []} />
+                <span style={{ fontSize: 12, color: colors.cobalt, fontWeight: 600 }}>
+                  {relObs.length > 0 ? relObs.length : "—"}
+                </span>
+                <span style={{ fontSize: 12, color: assocRisks.length > 0 ? colors.red : colors.gray, fontWeight: 600 }}>
+                  {assocRisks.length > 0 ? assocRisks.length : "—"}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FINDING STATE BADGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function FindingStateBadge({ state }: { state: string }) {
+  const fc = FINDING_STATE_COLORS[state] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray, label: state };
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: radii.pill,
+      backgroundColor: fc.bg, color: fc.fg, border: `1px solid ${fc.border}`,
+    }}>
+      {state === "satisfied"
+        ? <IcoCheckCircle size={11} style={{ color: fc.fg }} />
+        : <IcoXCircle size={11} style={{ color: fc.fg }} />}
+      {fc.label}
+    </span>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RISK LEVEL BADGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function RiskLevelBadge({ level }: { level: string }) {
+  const rc = RISK_LEVEL_COLORS[level] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+  return (
+    <span style={{
+      display: "inline-flex", alignItems: "center", gap: 4,
+      fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: radii.pill,
+      backgroundColor: rc.bg, color: rc.fg, border: `1px solid ${rc.border}`,
+      textTransform: "capitalize",
+    }}>
+      <IcoAlertTriangle size={11} style={{ color: rc.fg }} />
+      {level}
+    </span>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RISK STATUS BADGE
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function RiskStatusBadge({ status }: { status: string }) {
+  const sc = RISK_STATUS_COLORS[status] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+  return (
+    <span style={{
+      fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: radii.pill,
+      backgroundColor: sc.bg, color: sc.fg, border: `1px solid ${sc.border}`,
+      textTransform: "capitalize",
+    }}>
+      {status}
+    </span>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FINDING DETAIL VIEW
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function FindingDetailView({ finding, navigate, obsMap, riskMap, findingNistMap, obsNistMap }: {
+  finding: Finding;
+  navigate: (id: string) => void;
+  obsMap: Record<string, Observation>;
+  riskMap: Record<string, Risk>;
+  findingNistMap: Record<string, string[]>;
+  obsNistMap: Record<string, string[]>;
+}) {
+  const state = finding.target.status.state;
+  const fc = FINDING_STATE_COLORS[state] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray, label: state };
+  const relObs = (finding["related-observations"] ?? []).map((ro) => obsMap[ro["observation-uuid"]]).filter(Boolean);
+  const assocRisks = (finding["associated-risks"] ?? []).map((ar) => riskMap[ar["risk-uuid"]]).filter(Boolean);
+
+  return (
+    <div>
+      <Breadcrumbs items={[
+        { id: "overview", label: "Overview" },
+        { id: "findings", label: "Findings" },
+        { id: `finding-${finding.uuid}`, label: finding.target["target-id"].toUpperCase() },
+      ]} navigate={navigate} />
+
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <IcoTarget size={22} style={{ color: fc.fg }} />
+        <h1 style={{ fontSize: 20, color: colors.navy, margin: 0 }}>
+          {finding.target["target-id"].toUpperCase()}
+        </h1>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+        <FindingStateBadge state={state} />
+        {finding.target["implementation-status"] && (
+          <span style={{ fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: radii.pill, backgroundColor: colors.bg, color: colors.gray }}>
+            impl: {finding.target["implementation-status"].state}
+          </span>
+        )}
+        <span style={{ fontSize: 11, color: colors.gray, fontFamily: fonts.mono }}>{finding.uuid}</span>
+      </div>
+
+      {/* NIST Controls */}
+      {(findingNistMap?.[finding.uuid] ?? []).length > 0 && (
+        <Card style={{ borderLeft: `4px solid ${colors.navy}` }}>
+          <SectionLabel>NIST SP 800-53 Controls</SectionLabel>
+          <NistChips controls={findingNistMap[finding.uuid]} />
+        </Card>
+      )}
+
+      {/* Title + Description */}
+      {(finding.title || finding.description) && (
+        <Card style={{ borderLeft: `4px solid ${fc.border}` }}>
+          {finding.title && <div style={{ fontSize: 14, fontWeight: 700, color: colors.navy, marginBottom: 6 }}>{finding.title}</div>}
+          {finding.description && <div style={{ fontSize: 13, color: colors.black, lineHeight: 1.75 }}>{finding.description}</div>}
+        </Card>
+      )}
+
+      {/* Reason */}
+      {finding.target.status.reason && (
+        <Card>
+          <SectionLabel>Reason</SectionLabel>
+          <div style={{ fontSize: 13, color: colors.black }}>{finding.target.status.reason}</div>
+        </Card>
+      )}
+
+      {/* Remarks */}
+      {finding.remarks && (
+        <Card>
+          <SectionLabel>Remarks</SectionLabel>
+          <div style={{ fontSize: 13, color: colors.black, lineHeight: 1.75 }}>{finding.remarks}</div>
+        </Card>
+      )}
+
+      {/* Target Properties */}
+      {finding.target.props && finding.target.props.length > 0 && (
+        <Card>
+          <SectionLabel>Target Properties</SectionLabel>
+          <div style={{ display: "flex", flexWrap: "wrap" }}>
+            {finding.target.props.map((p, i) => <PropPill key={i} name={p.name} value={p.value} />)}
+          </div>
+        </Card>
+      )}
+
+      {/* Related Observations */}
+      {relObs.length > 0 && (
+        <Card>
+          <SectionLabel>Related Observations ({relObs.length})</SectionLabel>
+          <div style={{ fontSize: 12, color: colors.gray, marginBottom: 10 }}>
+            These observations provide the evidence for this finding.
+          </div>
+          {relObs.map((obs) => {
+            const obsStatus = getStatus(obs);
+            const sc = STATUS_COLORS[obsStatus] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+            return (
+              <div
+                key={obs.uuid}
+                onClick={() => navigate(`obs-${obs.uuid}`)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "10px 12px",
+                  marginBottom: 6, borderRadius: radii.sm, backgroundColor: colors.bg,
+                  cursor: "pointer", borderLeft: `3px solid ${sc.border}`,
+                }}
+              >
+                <IcoEye size={14} style={{ color: colors.cobalt }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: colors.navy }}>{obs.title}</div>
+                  {obs.remarks && <div style={{ fontSize: 11, color: colors.gray, marginTop: 2 }}>{trunc(obs.remarks, 120)}</div>}
+                </div>
+                <NistChipsInline controls={obsNistMap?.[obs.uuid] ?? []} />
+                <StatusBadge status={obsStatus} />
+              </div>
+            );
+          })}
+        </Card>
+      )}
+
+      {/* Associated Risks */}
+      {assocRisks.length > 0 && (
+        <Card style={{ borderLeft: `4px solid ${colors.red}` }}>
+          <SectionLabel>Associated Risks ({assocRisks.length})</SectionLabel>
+          <div style={{ fontSize: 12, color: colors.gray, marginBottom: 10 }}>
+            These risks express concerns resulting from this finding.
+          </div>
+          {assocRisks.map((risk) => {
+            const level = getRiskLevel(risk);
+            const rc = RISK_LEVEL_COLORS[level] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+            return (
+              <div
+                key={risk.uuid}
+                onClick={() => navigate(`risk-${risk.uuid}`)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "10px 12px",
+                  marginBottom: 6, borderRadius: radii.sm, backgroundColor: rc.bg,
+                  cursor: "pointer", border: `1px solid ${rc.border}`,
+                }}
+              >
+                <IcoAlertTriangle size={14} style={{ color: rc.fg }} />
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, color: colors.navy }}>{risk.title}</div>
+                  <div style={{ fontSize: 11, color: colors.gray, marginTop: 2 }}>{trunc(risk.description, 120)}</div>
+                </div>
+                <RiskLevelBadge level={level} />
+                <RiskStatusBadge status={risk.status} />
+              </div>
+            );
+          })}
+        </Card>
+      )}
+
+      {/* Links */}
+      {finding.links && finding.links.length > 0 && (() => {
+        const chips: ResolvedLink[] = finding.links.map((lk) => ({
+          text: lk.text ?? lk.href, href: lk.href.startsWith("#") ? undefined : lk.href, rel: lk.rel,
+        }));
+        return <Card><LinkChips links={chips} /></Card>;
+      })()}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RISKS LIST VIEW — tabular list of all risks sorted by severity
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function RisksListView({ risks, navigate, riskLevelCounts, riskStatusCounts, riskNistMap }: {
+  risks: Risk[];
+  navigate: (id: string) => void;
+  riskLevelCounts: Record<string, number>;
+  riskStatusCounts: Record<string, number>;
+  riskNistMap: Record<string, string[]>;
+}) {
+  const sorted = useMemo(() => {
+    return [...risks].sort((a, b) => riskSeveritySortKey(a) - riskSeveritySortKey(b));
+  }, [risks]);
+
+  return (
+    <div>
+      <Breadcrumbs items={[{ id: "overview", label: "Overview" }, { id: "risks", label: "Risks" }]} navigate={navigate} />
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+        <IcoAlertTriangle size={22} style={{ color: colors.red }} />
+        <h1 style={{ fontSize: 20, color: colors.navy, margin: 0 }}>Risks ({risks.length})</h1>
+      </div>
+      <div style={{ fontSize: 12, color: colors.gray, marginBottom: 16 }}>
+        Risks express concerns about failed findings. They include severity characterizations and recommended remediations.
+      </div>
+
+      {/* Severity Summary */}
+      <Card>
+        <SectionLabel>Severity Summary</SectionLabel>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 12 }}>
+          {["critical", "high", "moderate", "low"].filter((l) => riskLevelCounts[l]).map((level) => {
+            const rc = RISK_LEVEL_COLORS[level];
+            return (
+              <div key={level} style={{
+                display: "flex", alignItems: "center", gap: 8, padding: "8px 14px",
+                borderRadius: radii.md, backgroundColor: rc.bg, border: `1px solid ${rc.border}`,
+              }}>
+                <IcoAlertTriangle size={14} style={{ color: rc.fg }} />
+                <span style={{ fontSize: 20, fontWeight: 800, color: rc.fg }}>{riskLevelCounts[level]}</span>
+                <span style={{ fontSize: 12, fontWeight: 600, color: rc.fg, textTransform: "capitalize" }}>{level}</span>
+              </div>
+            );
+          })}
+        </div>
+        <SectionLabel>Status Summary</SectionLabel>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {Object.entries(riskStatusCounts).map(([status, count]) => {
+            const sc = RISK_STATUS_COLORS[status] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+            return (
+              <span key={status} style={{ fontSize: 11, fontWeight: 600, padding: "3px 10px", borderRadius: radii.pill, backgroundColor: sc.bg, color: sc.fg, border: `1px solid ${sc.border}` }}>
+                {count} {status}
+              </span>
+            );
+          })}
+        </div>
+      </Card>
+
+      {/* Risks table */}
+      <Card>
+        {sorted.map((risk) => {
+          const level = getRiskLevel(risk);
+          const rc = RISK_LEVEL_COLORS[level] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+          const remCount = risk.remediations?.length ?? 0;
+
+          return (
+            <div
+              key={risk.uuid}
+              onClick={() => navigate(`risk-${risk.uuid}`)}
+              style={{
+                display: "flex", alignItems: "flex-start", gap: 12, padding: "14px 12px",
+                marginBottom: 8, borderRadius: radii.md, backgroundColor: colors.white,
+                cursor: "pointer", borderLeft: `4px solid ${rc.border}`,
+                boxShadow: shadows.sm, transition: "box-shadow .15s",
+              }}
+            >
+              <IcoAlertTriangle size={18} style={{ color: rc.fg, flexShrink: 0, marginTop: 2 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: colors.navy, marginBottom: 4 }}>{risk.title}</div>
+                <div style={{ fontSize: 12, color: colors.gray, lineHeight: 1.6, marginBottom: 8 }}>{trunc(risk.description, 180)}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <RiskLevelBadge level={level} />
+                  <RiskStatusBadge status={risk.status} />
+                  {risk.deadline && (
+                    <span style={{ fontSize: 11, color: colors.gray }}>
+                      Deadline: {fmtDate(risk.deadline)}
+                    </span>
+                  )}
+                  {remCount > 0 && (
+                    <span style={{ fontSize: 11, color: colors.darkGreen, fontWeight: 600 }}>
+                      {remCount} remediation{remCount !== 1 ? "s" : ""}
+                    </span>
+                  )}
+                </div>
+                {(riskNistMap?.[risk.uuid] ?? []).length > 0 && (
+                  <div style={{ marginTop: 6 }}>
+                    <NistChipsInline controls={riskNistMap[risk.uuid]} />
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </Card>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RISK DETAIL VIEW — full detail for a single risk
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function RiskDetailView({ risk, navigate, allFindings, riskNistMap }: {
+  risk: Risk;
+  navigate: (id: string) => void;
+  allFindings: Finding[];
+  riskNistMap: Record<string, string[]>;
+}) {
+  const level = getRiskLevel(risk);
+  const rc = RISK_LEVEL_COLORS[level] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+  const facets = getRiskFacets(risk);
+  const mitigating = risk["mitigating-factors"] ?? [];
+  const remediations = risk.remediations ?? [];
+
+  // Find findings that reference this risk
+  const relatedFindings = allFindings.filter((f) =>
+    (f["associated-risks"] ?? []).some((ar) => ar["risk-uuid"] === risk.uuid)
+  );
+
+  return (
+    <div>
+      <Breadcrumbs items={[
+        { id: "overview", label: "Overview" },
+        { id: "risks", label: "Risks" },
+        { id: `risk-${risk.uuid}`, label: trunc(risk.title, 40) },
+      ]} navigate={navigate} />
+
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <IcoAlertTriangle size={22} style={{ color: rc.fg }} />
+        <h1 style={{ fontSize: 18, color: colors.navy, margin: 0, lineHeight: 1.4 }}>{risk.title}</h1>
+      </div>
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+        <RiskLevelBadge level={level} />
+        <RiskStatusBadge status={risk.status} />
+        {risk.deadline && (
+          <span style={{ fontSize: 11, fontWeight: 600, color: colors.gray }}>
+            Deadline: {fmtDate(risk.deadline)}
+          </span>
+        )}
+        <span style={{ fontSize: 11, color: colors.gray, fontFamily: fonts.mono }}>{risk.uuid}</span>
+      </div>
+
+      {/* NIST Controls */}
+      {(riskNistMap?.[risk.uuid] ?? []).length > 0 && (
+        <Card style={{ borderLeft: `4px solid ${colors.navy}` }}>
+          <SectionLabel>NIST SP 800-53 Controls</SectionLabel>
+          <NistChips controls={riskNistMap[risk.uuid]} />
+        </Card>
+      )}
+
+      {/* Description */}
+      <Card style={{ borderLeft: `4px solid ${rc.border}` }}>
+        <SectionLabel>Risk Description</SectionLabel>
+        <div style={{ fontSize: 13, color: colors.black, lineHeight: 1.75 }}>{risk.description}</div>
+      </Card>
+
+      {/* Statement */}
+      {risk.statement && (
+        <Card>
+          <SectionLabel>Risk Statement</SectionLabel>
+          <div style={{ fontSize: 13, color: colors.black, lineHeight: 1.75 }}>{risk.statement}</div>
+        </Card>
+      )}
+
+      {/* Characterization Facets */}
+      {facets.length > 0 && (
+        <Card>
+          <SectionLabel>Characterization</SectionLabel>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10 }}>
+            {facets.map((f, i) => {
+              const fLevel = f.value.toLowerCase();
+              const frc = RISK_LEVEL_COLORS[fLevel];
+              // Show only the meaningful tail of the system URI (e.g. "assessment/risk-system")
+              const systemShort = f.system
+                ? f.system.replace(/^https?:\/\/[^/]+\/(?:ns\/oscal\/)?/, "")
+                : "";
+              return (
+                <div key={i} style={{
+                  padding: "10px 14px", borderRadius: radii.sm,
+                  backgroundColor: frc ? alpha(frc.fg, 6) : colors.bg,
+                  borderLeft: `4px solid ${frc?.fg ?? colors.paleGray}`,
+                }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, color: colors.gray, marginBottom: 4 }}>
+                    {f.name}
+                  </div>
+                  <div style={{ fontSize: 16, fontWeight: 800, color: frc?.fg ?? colors.black, textTransform: "capitalize" }}>
+                    {f.value}
+                  </div>
+                  {systemShort && (
+                    <div style={{ fontSize: 9, color: alpha(colors.gray, 60), fontFamily: fonts.mono, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                      title={f.system}
+                    >
+                      {systemShort}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
+
+      {/* Related Findings */}
+      {relatedFindings.length > 0 && (
+        <Card>
+          <SectionLabel>Related Findings ({relatedFindings.length})</SectionLabel>
+          <div style={{ fontSize: 12, color: colors.gray, marginBottom: 10 }}>
+            These findings resulted in this risk being logged.
+          </div>
+          {relatedFindings.map((f) => {
+            const fState = f.target.status.state;
+            const ffc = FINDING_STATE_COLORS[fState] ?? { bg: colors.bg, fg: colors.gray, border: colors.gray };
+            return (
+              <div
+                key={f.uuid}
+                onClick={() => navigate(`finding-${f.uuid}`)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10, padding: "10px 12px",
+                  marginBottom: 6, borderRadius: radii.sm, backgroundColor: colors.bg,
+                  cursor: "pointer", borderLeft: `3px solid ${ffc.border}`,
+                }}
+              >
+                <IcoTarget size={14} style={{ color: ffc.fg }} />
+                <span style={{ fontSize: 13, fontWeight: 700, fontFamily: fonts.mono, color: colors.navy }}>
+                  {f.target["target-id"].toUpperCase()}
+                </span>
+                <FindingStateBadge state={fState} />
+                {f.title && <span style={{ fontSize: 12, color: colors.gray }}>{f.title}</span>}
+              </div>
+            );
+          })}
+        </Card>
+      )}
+
+      {/* Mitigating Factors */}
+      {mitigating.length > 0 && (
+        <Card>
+          <SectionLabel>Mitigating Factors ({mitigating.length})</SectionLabel>
+          {mitigating.map((mf, i) => (
+            <div key={mf.uuid ?? i} style={{
+              padding: "10px 14px", marginBottom: 6, borderRadius: radii.sm,
+              backgroundColor: alpha(colors.darkGreen, 5), borderLeft: `3px solid ${colors.darkGreen}`,
+            }}>
+              <div style={{ fontSize: 13, color: colors.black, lineHeight: 1.6 }}>{mf.description}</div>
+              {mf["implementation-uuid"] && (
+                <div style={{ fontSize: 10, color: colors.gray, fontFamily: fonts.mono, marginTop: 4 }}>
+                  Implementation: {mf["implementation-uuid"]}
+                </div>
+              )}
+            </div>
+          ))}
+        </Card>
+      )}
+
+      {/* Remediations */}
+      {remediations.length > 0 && (
+        <Card>
+          <SectionLabel>Remediations ({remediations.length})</SectionLabel>
+          {remediations.map((rem) => {
+            const lcColors: Record<string, string> = {
+              recommendation: colors.cobalt,
+              planned: colors.orange,
+              completed: colors.statusPassFg,
+            };
+            const lcColor = lcColors[rem.lifecycle] ?? colors.gray;
+
+            return (
+              <div key={rem.uuid} style={{
+                padding: "14px 16px", marginBottom: 8, borderRadius: radii.md,
+                backgroundColor: colors.white, boxShadow: shadows.sm,
+                borderLeft: `4px solid ${lcColor}`,
+              }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <IcoTool size={14} style={{ color: lcColor }} />
+                  <span style={{ fontSize: 14, fontWeight: 700, color: colors.navy }}>{rem.title}</span>
+                  <span style={{
+                    fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: radii.pill,
+                    backgroundColor: alpha(lcColor, 10), color: lcColor, textTransform: "capitalize",
+                  }}>
+                    {rem.lifecycle}
+                  </span>
+                </div>
+                <div style={{ fontSize: 13, color: colors.black, lineHeight: 1.7, marginBottom: 8 }}>{rem.description}</div>
+
+                {/* Tasks */}
+                {rem.tasks && rem.tasks.length > 0 && (
+                  <div style={{ marginTop: 8 }}>
+                    <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, color: colors.gray, marginBottom: 6 }}>
+                      Tasks ({rem.tasks.length})
+                    </div>
+                    {rem.tasks.map((task) => (
+                      <div key={task.uuid} style={{
+                        padding: "8px 12px", marginBottom: 4, borderRadius: radii.sm,
+                        backgroundColor: colors.bg, borderLeft: `2px solid ${colors.paleGray}`,
+                      }}>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: colors.navy }}>{task.title}</div>
+                        <div style={{ fontSize: 11, color: colors.gray, marginTop: 2 }}>{task.description}</div>
+                        {task.timing?.["within-date-range"] && (
+                          <div style={{ fontSize: 10, color: colors.gray, marginTop: 4 }}>
+                            {fmtDate(task.timing["within-date-range"].start)} — {fmtDate(task.timing["within-date-range"].end)}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Props */}
+                {rem.props && rem.props.length > 0 && (
+                  <div style={{ display: "flex", flexWrap: "wrap", marginTop: 8 }}>
+                    {rem.props.map((p, i) => <PropPill key={i} name={p.name} value={p.value} />)}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </Card>
+      )}
+
+      {/* Properties */}
+      {risk.props && risk.props.length > 0 && (
+        <Card>
+          <SectionLabel>Properties</SectionLabel>
+          <div style={{ display: "flex", flexWrap: "wrap" }}>
+            {risk.props.map((p, i) => <PropPill key={i} name={p.name} value={p.value} />)}
+          </div>
+        </Card>
+      )}
+
+      {/* Links */}
+      {risk.links && risk.links.length > 0 && (() => {
+        const chips: ResolvedLink[] = risk.links.map((lk) => ({
+          text: lk.text ?? lk.href, href: lk.href.startsWith("#") ? undefined : lk.href, rel: lk.rel,
+        }));
+        return <Card><LinkChips links={chips} /></Card>;
+      })()}
+    </div>
+  );
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
