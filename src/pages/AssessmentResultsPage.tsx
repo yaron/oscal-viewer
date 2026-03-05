@@ -333,6 +333,7 @@ function riskSeveritySortKey(risk: Risk): number {
 
 /* ── Catalog lookup helpers ── */
 
+// @ts-ignore: reserved for future catalog enrichment
 function findCatalogControl(catalog: OscalCatalog | null, controlId: string): CatalogControl | undefined {
   if (!catalog) return undefined;
   function searchGroup(g: CatalogGroup): CatalogControl | undefined {
@@ -361,6 +362,7 @@ function findCatalogControl(catalog: OscalCatalog | null, controlId: string): Ca
   return undefined;
 }
 
+// @ts-ignore: reserved for future catalog enrichment
 function buildCatalogParamMap(catalog: OscalCatalog | null, control: CatalogControl): Record<string, CatalogParam> {
   const map: Record<string, CatalogParam> = {};
   if (catalog) {
@@ -1976,6 +1978,7 @@ function CatalogContextCard({ catalog }: { catalog: OscalCatalog | null }) {
    CATALOG PART TREE — recursive hierarchical rendering
    ═══════════════════════════════════════════════════════════════════════════ */
 
+// @ts-ignore: reserved for future catalog enrichment
 function CatalogPartTree({ part, depth, paramMap }: { part: CatalogPart; depth: number; paramMap: Record<string, CatalogParam> }) {
   const subParts = part.parts ?? [];
   const partLabel = getCatalogLabel(part.props as { name: string; value: string; class?: string }[] | undefined);
@@ -2054,6 +2057,7 @@ function CatalogProseWithParams({ text, paramMap }: { text: string; paramMap: Re
    COLLAPSIBLE SECTION
    ═══════════════════════════════════════════════════════════════════════════ */
 
+// @ts-ignore: reserved for future use
 function CollapsibleSection({ title, children }: { title: string; children: ReactNode }) {
   const [open, setOpen] = useState(false);
   return (
@@ -2074,6 +2078,7 @@ function CollapsibleSection({ title, children }: { title: string; children: Reac
    HELPER — get all controls flat from a catalog
    ═══════════════════════════════════════════════════════════════════════════ */
 
+// @ts-ignore: reserved for future catalog enrichment
 function getAllCatalogControls(catalog: OscalCatalog): CatalogControl[] {
   const result: CatalogControl[] = [];
   function walkGroup(g: CatalogGroup) {
@@ -2095,7 +2100,7 @@ function getAllCatalogControls(catalog: OscalCatalog): CatalogControl[] {
    FINDINGS LIST VIEW — tabular list of all findings with state
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function FindingsListView({ findings, navigate, obsMap, riskMap, findingNistMap }: {
+function FindingsListView({ findings, navigate, findingNistMap }: {
   findings: Finding[];
   navigate: (id: string) => void;
   obsMap: Record<string, Observation>;

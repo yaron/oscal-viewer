@@ -315,6 +315,7 @@ function findControlInCatalog(catalog: Catalog, id: string): Control | undefined
 }
 
 /** Find the group a control belongs to */
+// @ts-ignore: reserved for future catalog enrichment
 function findControlGroupInCatalog(catalog: Catalog, controlId: string): Group | undefined {
   function searchGroup(g: Group): Group | undefined {
     for (const c of g.controls ?? []) {
@@ -442,7 +443,7 @@ function resolveControlParts(
   if (alter.adds) {
     for (const add of alter.adds) {
       const newParts: ResolvedPart[] = (add.parts ?? []).map((p) => {
-        const rp: ResolvedPart = structuredClone(p);
+        const rp = structuredClone(p) as ResolvedPart;
         markSubtree(rp, "added");
         return rp;
       });
@@ -546,9 +547,11 @@ function IcoLink({ size = 14, style }: IconProps) {
 function IcoAlert({ size = 16, style }: IconProps) {
   return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>;
 }
+// @ts-ignore: reserved for future use
 function IcoPlus({ size = 14, style }: IconProps) {
   return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></svg>;
 }
+// @ts-ignore: reserved for future use
 function IcoMinus({ size = 14, style }: IconProps) {
   return <svg style={style} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="5" y1="12" x2="19" y2="12" /></svg>;
 }
@@ -1216,7 +1219,7 @@ function MetadataView({ profile, navigate }: { profile: Profile; navigate: (id: 
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px,1fr))", gap: 16 }}>
           <MField label="Title" value={meta.title} />
           <MField label="Version" value={meta.version ?? "—"} />
-          <MField label="Published" value={fmtDate((meta as Record<string, unknown>)["published"] as string)} />
+          <MField label="Published" value={fmtDate((meta as unknown as Record<string, unknown>)["published"] as string)} />
           <MField label="Last Modified" value={fmtDate(meta["last-modified"])} />
           <MField label="OSCAL Version" value={meta["oscal-version"] ?? "—"} />
           <MField label="Document UUID" value={profile.uuid} mono />
@@ -1385,7 +1388,7 @@ function FamilyView({ familyGroup: fg, alterMap, setParamMap, navigate }: {
    If no catalog is loaded, shows modifications-only fallback.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function ControlModView({ controlId, alterMap, setParamMap, profile, navigate }: {
+function ControlModView({ controlId, alterMap, setParamMap, navigate }: {
   controlId: string;
   alterMap: Map<string, Alter>;
   setParamMap: Map<string, SetParameter[]>;

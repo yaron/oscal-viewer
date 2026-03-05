@@ -44,6 +44,7 @@ interface Link {
   rel?: string;
   text?: string;
   "media-type"?: string;
+  "resource-fragment"?: string;
 }
 
 interface Party {

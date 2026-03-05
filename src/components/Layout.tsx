@@ -6,7 +6,6 @@
 import { NavLink, Outlet, useLocation } from "react-router-dom";
 import type { CSSProperties } from "react";
 import { colors, fonts, oscalModels, shadows, brand } from "../theme/tokens";
-import { IconShield } from "./Icons";
 import { useOscal } from "../context/OscalContext";
 
 export default function Layout() {

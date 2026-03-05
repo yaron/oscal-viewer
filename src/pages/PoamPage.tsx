@@ -842,7 +842,7 @@ export default function PoamPage() {
             collapsed={!!mergedCollapsed["sec-poam-items"]}
             onToggle={() => toggleGroup("sec-poam-items")}
           >
-            {filteredPoamItems.map((pi, i) => {
+            {filteredPoamItems.map((pi) => {
               const poamId = getProp(pi.props, "poam-id");
               const piViewId = `poam-${pi.uuid}`;
               return (
@@ -1438,7 +1438,7 @@ function StatCard({ label, value, color }: { label: string; value: string | numb
    METADATA VIEW
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function MetadataView({ poam, navigate, resMap }: { poam: Poam; navigate: (id: string) => void; resMap: Record<string, Resource> }) {
+function MetadataView({ poam, navigate }: { poam: Poam; navigate: (id: string) => void; resMap: Record<string, Resource> }) {
   const meta = poam.metadata;
   return (
     <div>
