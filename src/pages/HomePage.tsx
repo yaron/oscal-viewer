@@ -5,7 +5,7 @@
 import { Link } from "react-router-dom";
 import type { CSSProperties } from "react";
 import { colors, fonts, oscalModels, shadows, radii, brand } from "../theme/tokens";
-import { IconShield, IconGrid, IconAlertTriangle } from "../components/Icons";
+import { IconShield, IconGrid, IconAlertTriangle, IconGitHub } from "../components/Icons";
 
 export default function HomePage() {
   return (
@@ -19,6 +19,15 @@ export default function HomePage() {
             <IconShield size={28} style={{ color: colors.orange }} />
           )}
           <h1 style={styles.heading}>{brand.heading}</h1>
+          <a
+            href="https://github.com/EasyDynamics/oscal-viewer"
+            target="_blank"
+            rel="noopener noreferrer"
+            title="View on GitHub"
+            style={{ display: "inline-flex", marginLeft: 8, color: colors.navy }}
+          >
+            <IconGitHub size={24} />
+          </a>
         </div>
         <p style={styles.subtitle}>A client-side tool for viewing and exploring OSCAL (Open Security Controls Assessment Language) documents. Select a model below to get started.</p>
 
