@@ -24,7 +24,9 @@ export default function Layout() {
         </NavLink>
 
         {brand.logoUrl ? (
-          <img src={brand.logoUrl} alt={brand.tagline} style={{ height: 20 }} />
+          <a href="https://oscal.io/" target="_blank" rel="noopener noreferrer">
+            <img src={brand.logoUrl} alt={brand.tagline} style={{ height: 20 }} />
+          </a>
         ) : (
           <span style={styles.tagline}>{brand.tagline}</span>
         )}
