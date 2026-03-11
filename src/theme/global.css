@@ -93,8 +93,30 @@ button:focus-visible {
 }
 
 /* ── OSCAL Markup Rendering ── */
+.oscal-markup,
+.oscal-markup p,
+.oscal-markup ul,
+.oscal-markup ol,
+.oscal-markup li,
+.oscal-markup blockquote,
+.oscal-markup h1,
+.oscal-markup h2,
+.oscal-markup h3,
+.oscal-markup h4,
+.oscal-markup h5,
+.oscal-markup h6 {
+  font-size: inherit;
+  line-height: inherit;
+  font-family: inherit;
+}
 .oscal-markup p { margin: 0 0 0.5em; }
 .oscal-markup p:last-child { margin-bottom: 0; }
+.oscal-markup h1,
+.oscal-markup h2,
+.oscal-markup h3,
+.oscal-markup h4,
+.oscal-markup h5,
+.oscal-markup h6 { font-weight: 700; margin: 0 0 0.25em; }
 .oscal-markup ul,
 .oscal-markup ol {
   margin: 0.25em 0 0.5em 1.5em;

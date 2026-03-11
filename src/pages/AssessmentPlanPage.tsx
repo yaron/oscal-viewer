@@ -16,6 +16,14 @@ import {
 import { Marked } from "marked";
 import { alpha, colors, fonts, radii, shadows, brand } from "../theme/tokens";
 import { useOscal } from "../context/OscalContext";
+import type {
+  Catalog as OscalCatalog,
+  Control as CatalogControl,
+  Group as CatalogGroup,
+  Part as CatalogPart,
+  Param as CatalogParam,
+  OscalProp as CatalogOscalProp,
+} from "../context/OscalContext";
 import { useSearchParams } from "react-router-dom";
 import { useUrlDocument, fileNameFromUrl } from "../hooks/useUrlDocument";
 import LinkChips from "../components/LinkChips";
@@ -35,7 +43,6 @@ interface StepParsed {
   remarks: string;
   controls: string[];
   method: string;
-  criticality: string;
   links: OscalLink[];
 }
 
@@ -43,6 +50,7 @@ interface ActivityParsed {
   uuid: string;
   title: string;
   description: string;
+  relatedControls: string[];
   steps: StepParsed[];
 }
 
@@ -104,10 +112,103 @@ function MarkupBlock({ value, style }: { value: unknown; style?: CSSProperties }
   return (
     <div
       className="oscal-markup"
-      style={{ fontSize: 13, color: colors.black, lineHeight: 1.75, ...style }}
+      style={{ fontSize: 12.5, color: colors.black, lineHeight: 1.5, ...style }}
       dangerouslySetInnerHTML={{ __html: renderMarkup(raw) }}
     />
   );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   OSCAL control-selection extraction — handles both `with-ids` (string[])
+   and `include-controls` (array of {control-id}) per the OSCAL schema.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function extractControlIds(sel: any): string[] {
+  const ids: string[] = [];
+  // with-ids: string[] (older / alternate form)
+  for (const c of sel["with-ids"] ?? []) {
+    ids.push(typeof c === "string" ? c : String(c));
+  }
+  // include-controls: [{control-id: "..."}] (standard OSCAL)
+  for (const ic of sel["include-controls"] ?? []) {
+    if (typeof ic === "string") ids.push(ic);
+    else if (ic["control-id"]) ids.push(ic["control-id"]);
+  }
+  return ids;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CATALOG CONTROL LOOKUP — find a control in a loaded catalog
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function findCatalogControl(catalog: OscalCatalog, id: string): CatalogControl | undefined {
+  function searchGroup(g: CatalogGroup): CatalogControl | undefined {
+    for (const c of g.controls ?? []) {
+      if (c.id === id) return c;
+      for (const enh of c.controls ?? []) { if (enh.id === id) return enh; }
+    }
+    for (const sg of g.groups ?? []) {
+      const found = searchGroup(sg);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  for (const g of catalog.groups ?? []) {
+    const found = searchGroup(g);
+    if (found) return found;
+  }
+  for (const c of catalog.controls ?? []) {
+    if (c.id === id) return c;
+    for (const enh of c.controls ?? []) { if (enh.id === id) return enh; }
+  }
+  return undefined;
+}
+
+function findParentCatalogControl(catalog: OscalCatalog, enhId: string): CatalogControl | undefined {
+  function searchGroup(g: CatalogGroup): CatalogControl | undefined {
+    for (const c of g.controls ?? []) {
+      for (const enh of c.controls ?? []) { if (enh.id === enhId) return c; }
+    }
+    for (const sg of g.groups ?? []) {
+      const found = searchGroup(sg);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  for (const g of catalog.groups ?? []) {
+    const found = searchGroup(g);
+    if (found) return found;
+  }
+  for (const c of catalog.controls ?? []) {
+    for (const enh of c.controls ?? []) { if (enh.id === enhId) return c; }
+  }
+  return undefined;
+}
+
+function getCatalogLabel(props?: CatalogOscalProp[]): string {
+  if (!props) return "";
+  const lbl = props.find((p) => p.name === "label" && p.class !== "zero-padded");
+  return lbl?.value ?? props.find((p) => p.name === "label")?.value ?? "";
+}
+
+function resolveInlineParams(text: string, paramMap: Record<string, CatalogParam>): string {
+  return text.replace(/\{\{\s*insert:\s*param\s*,\s*([^}]+?)\s*\}\}/g, (_match, id: string) => {
+    const param = paramMap[id.trim()];
+    if (!param) return `[Assignment: ${id.trim()}]`;
+    return renderParamText(param, paramMap);
+  });
+}
+
+function renderParamText(param: CatalogParam, paramMap: Record<string, CatalogParam>): string {
+  if (param.select) {
+    const howMany = param.select["how-many"];
+    const prefix = howMany === "one-or-more" ? "Selection (one or more)" : "Selection";
+    const choices = (param.select.choice ?? []).map((c) => resolveInlineParams(c, paramMap));
+    return `[${prefix}: ${choices.join("; ")}]`;
+  }
+  const label = param.label ? resolveInlineParams(param.label, paramMap) : param.id;
+  return `[Assignment: ${label}]`;
 }
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -120,16 +221,13 @@ function parseAssessmentPlan(raw: any): PlanParsed {
     uuid: a.uuid,
     title: a.title || "",
     description: txt(a.description),
+    relatedControls: (a["related-controls"]?.["control-selections"] || [])
+      .flatMap((sel: any) => extractControlIds(sel)),
     steps: (a.steps || []).map((s: any) => {
       const props: OscalProp[] = s.props || [];
       const method = props.find((p: OscalProp) => p.name === "method")?.value ?? "EXAMINE";
-      const criticality = props.find((p: OscalProp) => p.name === "criticality")?.value ?? "MAY";
       const controls: string[] = (s["reviewed-controls"]?.["control-selections"] || [])
-        .flatMap((sel: any) =>
-          (sel["control-id-selections"] || sel["with-ids"] || []).map((c: any) =>
-            typeof c === "string" ? c : c["control-id"] ?? c,
-          ),
-        );
+        .flatMap((sel: any) => extractControlIds(sel));
       const links: OscalLink[] = (s.links || []).map((l: any) => ({
         href: l.href || "",
         rel: l.rel || "",
@@ -142,7 +240,6 @@ function parseAssessmentPlan(raw: any): PlanParsed {
         remarks: txt(s.remarks),
         controls,
         method: method.toUpperCase(),
-        criticality: criticality.toUpperCase(),
         links,
       } as StepParsed;
     }),
@@ -264,14 +361,9 @@ function IcoDown({ size = 14, style }: IconProps) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
-   CRITICALITY & METHOD STYLING
+   METHOD STYLING
    ═══════════════════════════════════════════════════════════════════════════ */
 
-const CRIT: Record<string, { bg: string; text: string; border: string }> = {
-  SHALL:  { bg: colors.tintOrange, text: colors.orange, border: colors.orange },
-  SHOULD: { bg: colors.tintBlue, text: colors.navy, border: colors.cobalt },
-  MAY:    { bg: colors.surfaceMuted, text: colors.textSecondary, border: colors.gray },
-};
 const METH: Record<string, { bg: string; text: string }> = {
   EXAMINE:   { bg: colors.tintGreen, text: colors.darkGreen },
   INTERVIEW: { bg: colors.tintPurple, text: colors.purple },
@@ -331,19 +423,6 @@ function ControlBadge({ control, active, onClick }: { control: string; active: b
     }}>
       <IcoShield size={10} />{control}
     </button>
-  );
-}
-
-function CritTag({ v }: { v: string }) {
-  const c = CRIT[v] || CRIT.MAY;
-  return (
-    <span style={{
-      display: "inline-block", padding: "1px 8px", borderRadius: 3,
-      fontSize: 10, fontWeight: 700, fontFamily: fonts.sans, letterSpacing: "0.05em",
-      background: c.bg, color: c.text, borderLeft: `3px solid ${c.border}`,
-    }}>
-      {v}
-    </span>
   );
 }
 
@@ -452,6 +531,176 @@ function DropZone({ onFile, error, sourceUrl }: { onFile: (f: File) => void; err
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   CATALOG CONTROL DETAIL PANEL — expandable inline control info
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+const PART_SECTIONS: { name: string; label: string; color: string }[] = [
+  { name: "overview", label: "Overview", color: colors.cobalt },
+  { name: "statement", label: "Statement", color: colors.navy },
+  { name: "guidance", label: "Guidance", color: colors.brightBlue },
+];
+
+function CtrlPartTree({ part, depth, paramMap }: { part: CatalogPart; depth: number; paramMap: Record<string, CatalogParam> }) {
+  const subParts = part.parts ?? [];
+  const partLabel = getCatalogLabel(part.props);
+  const depthColors = [colors.navy, colors.brightBlue, colors.cobalt, colors.gray, colors.blueGray];
+  const borderColor = depthColors[depth % depthColors.length];
+  return (
+    <div style={{
+      marginTop: depth === 0 ? 0 : 8,
+      paddingLeft: depth > 0 ? 16 : 0,
+      borderLeft: depth > 0 ? `3px solid ${borderColor}` : "none",
+    }}>
+      {partLabel && <span style={{ fontSize: 12, fontWeight: 700, color: borderColor, fontFamily: fonts.mono, marginRight: 6 }}>{partLabel}</span>}
+      {part.prose && <MarkupBlock value={resolveInlineParams(part.prose, paramMap)} style={{ fontSize: 12.5 }} />}
+      {subParts.length > 0 && subParts.map((sp, i) => <CtrlPartTree key={sp.id ?? i} part={sp} depth={depth + 1} paramMap={paramMap} />)}
+    </div>
+  );
+}
+
+function ControlDetailPanel({ controlId, catalog }: { controlId: string; catalog: OscalCatalog }) {
+  const [expanded, setExpanded] = useState(false);
+  const control = useMemo(() => findCatalogControl(catalog, controlId), [catalog, controlId]);
+
+  if (!control) {
+    return (
+      <div style={{
+        display: "flex", alignItems: "center", gap: 6, padding: "6px 12px",
+        background: colors.surfaceMuted, borderRadius: radii.sm, marginBottom: 4,
+        border: `1px solid ${colors.borderSubtle}`,
+      }}>
+        <IcoShield size={12} style={{ color: colors.gray }} />
+        <span style={{ fontSize: 12, fontFamily: fonts.mono, fontWeight: 600, color: colors.navy }}>{controlId}</span>
+        <span style={{ fontSize: 11, color: colors.gray, fontStyle: "italic" }}>— not found in loaded catalog</span>
+      </div>
+    );
+  }
+
+  const lbl = getCatalogLabel(control.props);
+  const allParts = control.parts ?? [];
+  const params = control.params ?? [];
+  const enhancements = control.controls ?? [];
+
+  const paramMap = useMemo(() => {
+    const map: Record<string, CatalogParam> = {};
+    const parent = findParentCatalogControl(catalog, control.id);
+    if (parent) (parent.params ?? []).forEach((p) => { map[p.id] = p; });
+    params.forEach((p) => { map[p.id] = p; });
+    enhancements.forEach((enh) => (enh.params ?? []).forEach((p) => { map[p.id] = p; }));
+    return map;
+  }, [catalog, control, params, enhancements]);
+
+  const sectionParts: Record<string, CatalogPart[]> = {};
+  PART_SECTIONS.forEach((s) => { sectionParts[s.name] = allParts.filter((p) => p.name === s.name); });
+
+  return (
+    <div style={{
+      background: colors.card, borderRadius: radii.sm, marginBottom: 6,
+      border: `1px solid ${colors.border}`, borderLeft: `4px solid ${colors.purple}`,
+      overflow: "hidden",
+    }}>
+      <div
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 8, padding: "8px 14px",
+          cursor: "pointer", userSelect: "none",
+        }}
+      >
+        <IcoRight size={12} style={{ color: colors.purple, transform: expanded ? "rotate(90deg)" : "rotate(0)", transition: "transform .15s" }} />
+        <IcoShield size={13} style={{ color: colors.purple }} />
+        <span style={{ fontSize: 12, fontWeight: 700, color: colors.navy, fontFamily: fonts.mono }}>{lbl ? `${lbl} ` : ""}</span>
+        <span style={{ fontSize: 12.5, fontWeight: 600, color: colors.black }}>{control.title}</span>
+        <span style={{ fontSize: 10, color: colors.gray, fontFamily: fonts.mono, marginLeft: "auto" }}>{control.id}</span>
+      </div>
+
+      {expanded && (
+        <div style={{ padding: "0 14px 12px" }}>
+          {PART_SECTIONS.map((sec) => {
+            const pts = sectionParts[sec.name];
+            if (!pts || pts.length === 0) return null;
+            return (
+              <div key={sec.name} style={{
+                padding: "8px 12px", marginTop: 8,
+                backgroundColor: colors.surfaceMuted, borderRadius: radii.sm,
+                borderLeft: `3px solid ${sec.color}`,
+              }}>
+                <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: sec.color, marginBottom: 6 }}>
+                  {sec.label}
+                </div>
+                {pts.map((part, i) => <CtrlPartTree key={part.id ?? i} part={part} depth={0} paramMap={paramMap} />)}
+              </div>
+            );
+          })}
+          {params.length > 0 && (
+            <div style={{ padding: "8px 12px", marginTop: 8, backgroundColor: colors.surfaceMuted, borderRadius: radii.sm }}>
+              <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: colors.orange, marginBottom: 6 }}>
+                Parameters ({params.length})
+              </div>
+              {params.map((p) => (
+                <div key={p.id} style={{ display: "flex", alignItems: "baseline", gap: 8, fontSize: 11.5, marginBottom: 2 }}>
+                  <span style={{ fontFamily: fonts.mono, color: colors.gray, fontWeight: 600, minWidth: 90 }}>{p.id}</span>
+                  <span style={{
+                    fontFamily: fonts.mono, fontWeight: 600, fontSize: 11,
+                    color: p.select ? colors.cobalt : colors.orange,
+                    backgroundColor: p.select ? alpha(colors.cobalt, 7) : alpha(colors.orange, 7),
+                    padding: "1px 6px", borderRadius: radii.sm,
+                  }}>{renderParamText(p, paramMap)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {enhancements.length > 0 && (
+            <div style={{ padding: "8px 12px", marginTop: 8, backgroundColor: colors.surfaceMuted, borderRadius: radii.sm }}>
+              <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: colors.cobalt, marginBottom: 6 }}>
+                Enhancements ({enhancements.length})
+              </div>
+              {enhancements.map((enh) => {
+                const eLbl = getCatalogLabel(enh.props);
+                return (
+                  <div key={enh.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 0", fontSize: 11.5 }}>
+                    <span style={{ fontWeight: 600, color: colors.navy, fontFamily: fonts.mono, minWidth: 70 }}>{eLbl || enh.id}</span>
+                    <span style={{ color: colors.black }}>{enh.title}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RELATED CONTROLS SECTION — shown in activity view when controls exist
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function RelatedControlsSection({ controlIds, catalog, hCtrl, onCtrl }: {
+  controlIds: string[]; catalog: OscalCatalog | null; hCtrl: string; onCtrl: (c: string) => void;
+}) {
+  if (controlIds.length === 0) return null;
+  return (
+    <div style={{
+      background: colors.card, borderRadius: radii.sm, padding: "12px 16px", marginBottom: 16,
+      border: `1px solid ${colors.border}`,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <IcoShield size={14} style={{ color: colors.purple }} />
+        <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.06em", color: colors.purple }}>
+          Related Controls ({controlIds.length})
+        </span>
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: catalog ? 10 : 0 }}>
+        {controlIds.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
+      </div>
+      {catalog && controlIds.map((cid) => (
+        <ControlDetailPanel key={cid} controlId={cid} catalog={catalog} />
+      ))}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    STEP CARD
    ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -473,7 +722,6 @@ function StepCard({ step, index, hCtrl, onCtrl }: {
         <span style={{ fontSize: 12, fontWeight: 700, fontFamily: fonts.mono, color: colors.navy, whiteSpace: "nowrap" }}>
           {step.title}
         </span>
-        <CritTag v={step.criticality} />
         <MethTag v={step.method} />
         <div style={{ flex: 1 }} />
         <div style={{ display: "flex", flexWrap: "wrap", gap: 3, justifyContent: "flex-end" }}>
@@ -481,7 +729,7 @@ function StepCard({ step, index, hCtrl, onCtrl }: {
         </div>
       </div>
       {step.description && (
-        <MarkupBlock value={step.description} style={{ margin: "0 0 0 30px", fontSize: 12.5, lineHeight: 1.45 }} />
+        <MarkupBlock value={step.description} style={{ margin: "0 0 0 30px", fontSize: 12, lineHeight: 1.4 }} />
       )}
       {step.remarks && (
         <p style={{ fontSize: 11.5, color: colors.blueGray, lineHeight: 1.4, margin: "4px 0 0 30px", fontFamily: fonts.sans, fontStyle: "italic" }}>
@@ -527,36 +775,47 @@ function StepList({ activity, hCtrl, onCtrl }: {
 function ActivityHeader({ activity, hCtrl, onCtrl }: {
   activity: ActivityParsed; hCtrl: string; onCtrl: (c: string) => void;
 }) {
-  const shallN = activity.steps.filter((s) => s.criticality === "SHALL").length;
-  const shouldN = activity.steps.filter((s) => s.criticality === "SHOULD").length;
   const ctrls = [...new Set(activity.steps.flatMap((s) => s.controls))].sort();
   return (
     <>
       <div style={{
-        background: colors.navy, color: colors.textOnAccent, padding: "12px 18px",
+        background: colors.card, color: colors.navy, padding: "12px 18px",
         borderRadius: "8px 8px 0 0", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+        borderTop: `3px solid ${colors.orange}`,
+        border: `1px solid ${colors.border}`, borderTopWidth: 3, borderTopColor: colors.orange,
       }}>
         <div style={{ flex: 1, minWidth: 0 }}>
-          <h2 style={{ fontSize: 15, fontWeight: 700, fontFamily: fonts.sans, margin: 0 }}>{activity.title}</h2>
+          <h2 style={{ fontSize: 15, fontWeight: 700, fontFamily: fonts.sans, margin: 0, color: colors.navy }}>{activity.title}</h2>
           {activity.description && (
-            <p style={{ fontSize: 12, opacity: 0.7, margin: "2px 0 0", fontFamily: fonts.sans }}>{activity.description}</p>
+            <MarkupBlock value={activity.description} style={{ fontSize: 12, margin: "2px 0 0", fontFamily: fonts.sans, color: colors.blueGray }} />
           )}
         </div>
         <div style={{ display: "flex", gap: 8, fontSize: 10.5, fontWeight: 600, fontFamily: fonts.mono, flexShrink: 0 }}>
-          <span style={{ background: alpha(colors.white, 12), padding: "2px 8px", borderRadius: 3 }}>{activity.steps.length} steps</span>
-          <span style={{ background: alpha(colors.orange, 25), color: colors.orange, padding: "2px 8px", borderRadius: 3 }}>{shallN} SHALL</span>
-          {shouldN > 0 && <span style={{ background: alpha(colors.white, 8), padding: "2px 8px", borderRadius: 3, opacity: 0.7 }}>{shouldN} SHOULD</span>}
+          <span style={{ background: colors.surfaceMuted, color: colors.navy, padding: "2px 8px", borderRadius: 3 }}>{activity.steps.length} steps</span>
         </div>
       </div>
-      <div style={{
-        background: colors.surfaceSubtle, padding: "6px 18px", display: "flex", flexWrap: "wrap",
-        gap: 4, alignItems: "center", borderBottom: `2px solid ${colors.orange}`,
-      }}>
-        <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: colors.gray, marginRight: 6, fontFamily: fonts.sans }}>
-          Controls:
-        </span>
-        {ctrls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
-      </div>
+      {ctrls.length > 0 && (
+        <div style={{
+          background: colors.surfaceSubtle, padding: "6px 18px", display: "flex", flexWrap: "wrap",
+          gap: 4, alignItems: "center", borderBottom: activity.relatedControls.length > 0 ? `1px solid ${colors.borderSubtle}` : `2px solid ${colors.orange}`,
+        }}>
+          <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: colors.gray, marginRight: 6, fontFamily: fonts.sans }}>
+            Step Controls:
+          </span>
+          {ctrls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
+        </div>
+      )}
+      {activity.relatedControls.length > 0 && (
+        <div style={{
+          background: colors.surfaceMuted, padding: "6px 18px", display: "flex", flexWrap: "wrap",
+          gap: 4, alignItems: "center", borderBottom: `2px solid ${colors.orange}`,
+        }}>
+          <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: colors.purple, marginRight: 6, fontFamily: fonts.sans }}>
+            Related Controls:
+          </span>
+          {activity.relatedControls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
+        </div>
+      )}
     </>
   );
 }
@@ -568,8 +827,6 @@ function ActivityHeader({ activity, hCtrl, onCtrl }: {
 function ActivitySubheader({ activity, hCtrl, onCtrl }: {
   activity: ActivityParsed; hCtrl: string; onCtrl: (c: string) => void;
 }) {
-  const shallN = activity.steps.filter((s) => s.criticality === "SHALL").length;
-  const shouldN = activity.steps.filter((s) => s.criticality === "SHOULD").length;
   const ctrls = [...new Set(activity.steps.flatMap((s) => s.controls))].sort();
   return (
     <>
@@ -581,24 +838,38 @@ function ActivitySubheader({ activity, hCtrl, onCtrl }: {
         <IcoAct size={14} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <span style={{ fontSize: 13, fontWeight: 700, color: colors.navy, fontFamily: fonts.sans }}>{activity.title}</span>
+          {activity.description && (
+            <MarkupBlock value={activity.description} style={{ fontSize: 12, color: colors.blueGray, margin: "2px 0 0", fontFamily: fonts.sans }} />
+          )}
         </div>
         <div style={{ display: "flex", gap: 6, fontSize: 10, fontWeight: 600, fontFamily: fonts.mono, flexShrink: 0 }}>
           <span style={{ background: colors.surfaceSubtle, color: colors.navy, padding: "2px 7px", borderRadius: 3 }}>{activity.steps.length} steps</span>
-          <span style={{ background: CRIT.SHALL.bg, color: CRIT.SHALL.text, padding: "2px 7px", borderRadius: 3 }}>{shallN} SHALL</span>
-          {shouldN > 0 && <span style={{ background: CRIT.SHOULD.bg, color: CRIT.SHOULD.text, padding: "2px 7px", borderRadius: 3 }}>{shouldN} SHOULD</span>}
         </div>
       </div>
       <div style={{
         background: colors.surfaceMuted, padding: "6px 18px", display: "flex", flexWrap: "wrap",
         gap: 4, alignItems: "center",
         borderLeft: `1px solid ${colors.border}`, borderRight: `1px solid ${colors.border}`,
-        borderBottom: `2px solid ${colors.orange}`,
+        borderBottom: activity.relatedControls.length > 0 ? `1px solid ${colors.borderSubtle}` : `2px solid ${colors.orange}`,
       }}>
         <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: colors.gray, marginRight: 6 }}>
-          Controls:
+          Step Controls:
         </span>
         {ctrls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
       </div>
+      {activity.relatedControls.length > 0 && (
+        <div style={{
+          background: colors.surfaceMuted, padding: "6px 18px", display: "flex", flexWrap: "wrap",
+          gap: 4, alignItems: "center",
+          borderLeft: `1px solid ${colors.border}`, borderRight: `1px solid ${colors.border}`,
+          borderBottom: `2px solid ${colors.orange}`,
+        }}>
+          <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: colors.purple, marginRight: 6 }}>
+            Related Controls:
+          </span>
+          {activity.relatedControls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
+        </div>
+      )}
     </>
   );
 }
@@ -636,27 +907,24 @@ function BreadcrumbHeader({ planTitle, crumbs, onHome }: {
    CONTROLS PANEL (sidebar collapsible)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function CtrlPanel({ allControls, hCtrl, onCtrl }: {
-  allControls: string[]; hCtrl: string; onCtrl: (c: string) => void;
+function CtrlPanel({ allControls, onClick, isActive }: {
+  allControls: string[]; onClick: () => void; isActive: boolean;
 }) {
-  const [open, setOpen] = useState(false);
   return (
     <div style={{ borderTop: `1px solid ${colors.borderSubtle}` }}>
-      <button onClick={() => setOpen(!open)} style={{
+      <button onClick={onClick} style={{
         width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
         padding: "8px 14px", border: "none", cursor: "pointer",
-        background: open ? colors.surfaceMuted : "transparent",
+        background: isActive ? alpha(colors.navy, 8) : "transparent",
+        borderLeft: `3px solid ${isActive ? colors.orange : "transparent"}`,
         fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em",
         color: colors.navy, fontFamily: fonts.sans,
       }}>
-        <span>Controls ({allControls.length})</span>
-        {open ? <IcoDown size={12} /> : <IcoRight size={12} />}
+        <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <IcoShield size={12} />Controls ({allControls.length})
+        </span>
+        <IcoRight size={12} />
       </button>
-      {open && (
-        <div style={{ padding: "4px 14px 10px", display: "flex", flexWrap: "wrap", gap: 3, maxHeight: 160, overflowY: "auto" }}>
-          {allControls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
-        </div>
-      )}
     </div>
   );
 }
@@ -667,7 +935,7 @@ function CtrlPanel({ allControls, hCtrl, onCtrl }: {
 
 function OverviewView({ plan, stats, allControls, hCtrl, onCtrl, onSelectActivity }: {
   plan: PlanParsed;
-  stats: { totalActivities: number; totalSteps: number; shallCount: number; totalControls: number; totalTasks: number };
+  stats: { totalActivities: number; totalSteps: number; totalControls: number; totalTasks: number };
   allControls: string[];
   hCtrl: string;
   onCtrl: (c: string) => void;
@@ -693,7 +961,6 @@ function OverviewView({ plan, stats, allControls, hCtrl, onCtrl, onSelectActivit
           {[
             { v: stats.totalActivities, l: "Activities", c: colors.navy },
             { v: stats.totalSteps, l: "Steps", c: colors.brightBlue },
-            { v: stats.shallCount, l: "SHALL", c: colors.orange },
             { v: stats.totalControls, l: "Controls", c: colors.darkGreen },
             ...(stats.totalTasks > 0 ? [{ v: stats.totalTasks, l: "Tasks", c: colors.purple }] : []),
           ].map((s) => (
@@ -703,24 +970,12 @@ function OverviewView({ plan, stats, allControls, hCtrl, onCtrl, onSelectActivit
             </div>
           ))}
         </div>
-
-        {/* Controls */}
-        <div>
-          <div style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: colors.gray, marginBottom: 6 }}>
-            Addressed Controls ({allControls.length})
-          </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-            {allControls.map((c) => <ControlBadge key={c} control={c} active={hCtrl === c} onClick={onCtrl} />)}
-          </div>
-        </div>
       </Card>
 
       {/* Activity cards */}
       {plan.activities.map((a) => {
-        const shallN = a.steps.filter((s) => s.criticality === "SHALL").length;
-        const shouldN = a.steps.filter((s) => s.criticality === "SHOULD").length;
-        const ctrls = [...new Set(a.steps.flatMap((s) => s.controls))].sort();
-        const matchCount = hCtrl ? a.steps.filter((s) => s.controls.includes(hCtrl)).length : 0;
+        const ctrls = [...new Set([...a.steps.flatMap((s) => s.controls), ...a.relatedControls])].sort();
+        const matchCount = hCtrl ? a.steps.filter((s) => s.controls.includes(hCtrl)).length + (a.relatedControls.includes(hCtrl) ? 1 : 0) : 0;
         return (
           <div key={a.uuid} onClick={() => onSelectActivity(a.uuid)} style={{
             background: colors.card, borderRadius: 8,
@@ -732,13 +987,11 @@ function OverviewView({ plan, stats, allControls, hCtrl, onCtrl, onSelectActivit
               <div style={{ flex: 1, minWidth: 0 }}>
                 <h3 style={{ fontSize: 14, fontWeight: 700, color: colors.navy, margin: 0, fontFamily: fonts.sans }}>{a.title}</h3>
                 {a.description && (
-                  <p style={{ fontSize: 12, color: colors.gray, margin: "2px 0 0", fontFamily: fonts.sans }}>{trunc(a.description, 120)}</p>
+                  <MarkupBlock value={a.description} style={{ fontSize: 12, color: colors.blueGray, margin: "2px 0 0", fontFamily: fonts.sans, maxHeight: 40, overflow: "hidden" }} />
                 )}
               </div>
               <div style={{ display: "flex", gap: 6, fontSize: 10, fontWeight: 600, fontFamily: fonts.mono, flexShrink: 0 }}>
                 <span style={{ background: colors.surfaceSubtle, color: colors.navy, padding: "2px 7px", borderRadius: 3 }}>{a.steps.length} steps</span>
-                <span style={{ background: CRIT.SHALL.bg, color: CRIT.SHALL.text, padding: "2px 7px", borderRadius: 3 }}>{shallN} SHALL</span>
-                {shouldN > 0 && <span style={{ background: CRIT.SHOULD.bg, color: CRIT.SHOULD.text, padding: "2px 7px", borderRadius: 3 }}>{shouldN} SHOULD</span>}
                 {matchCount > 0 && <span style={{ background: colors.tintOrange, color: colors.orange, padding: "2px 7px", borderRadius: 3, fontWeight: 700 }}>{matchCount} match{matchCount !== 1 ? "es" : ""}</span>}
               </div>
               <IcoRight size={16} />
@@ -757,14 +1010,19 @@ function OverviewView({ plan, stats, allControls, hCtrl, onCtrl, onSelectActivit
    VIEW: ACTIVITY (full step list)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function ActivityView({ activity, planTitle, hCtrl, onCtrl, onHome }: {
-  activity: ActivityParsed; planTitle: string; hCtrl: string; onCtrl: (c: string) => void; onHome: () => void;
+function ActivityView({ activity, planTitle, hCtrl, onCtrl, onHome, catalog }: {
+  activity: ActivityParsed; planTitle: string; hCtrl: string; onCtrl: (c: string) => void; onHome: () => void; catalog: OscalCatalog | null;
 }) {
   return (
     <>
       <BreadcrumbHeader planTitle={planTitle} crumbs={[activity.title]} onHome={onHome} />
       <ActivityHeader activity={activity} hCtrl={hCtrl} onCtrl={onCtrl} />
       <StepList activity={activity} hCtrl={hCtrl} onCtrl={onCtrl} />
+      {activity.relatedControls.length > 0 && (
+        <div style={{ marginTop: 16 }}>
+          <RelatedControlsSection controlIds={activity.relatedControls} catalog={catalog} hCtrl={hCtrl} onCtrl={onCtrl} />
+        </div>
+      )}
     </>
   );
 }
@@ -773,8 +1031,8 @@ function ActivityView({ activity, planTitle, hCtrl, onCtrl, onHome }: {
    VIEW: TASK (timing + associated activities)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function TaskView({ task, planTitle, hCtrl, onCtrl, onHome }: {
-  task: TaskParsed; planTitle: string; hCtrl: string; onCtrl: (c: string) => void; onHome: () => void;
+function TaskView({ task, planTitle, hCtrl, onCtrl, onHome, catalog }: {
+  task: TaskParsed; planTitle: string; hCtrl: string; onCtrl: (c: string) => void; onHome: () => void; catalog: OscalCatalog | null;
 }) {
   return (
     <>
@@ -799,6 +1057,11 @@ function TaskView({ task, planTitle, hCtrl, onCtrl, onHome }: {
         <div key={act.uuid} style={{ marginBottom: 20 }}>
           <ActivitySubheader activity={act} hCtrl={hCtrl} onCtrl={onCtrl} />
           <StepList activity={act} hCtrl={hCtrl} onCtrl={onCtrl} />
+          {act.relatedControls.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <RelatedControlsSection controlIds={act.relatedControls} catalog={catalog} hCtrl={hCtrl} onCtrl={onCtrl} />
+            </div>
+          )}
         </div>
       ))}
     </>
@@ -806,11 +1069,201 @@ function TaskView({ task, planTitle, hCtrl, onCtrl, onHome }: {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+   VIEW: CONTROLS (control-centric view showing activities per control)
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+function ControlsView({ plan, allControls, catalog, hCtrl, onCtrl, onHome, onSelectActivity }: {
+  plan: PlanParsed; allControls: string[]; catalog: OscalCatalog | null;
+  hCtrl: string; onCtrl: (c: string) => void; onHome: () => void;
+  onSelectActivity: (uuid: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+
+  // Build control → activities mapping
+  const controlActivityMap = useMemo(() => {
+    const map: Record<string, { activity: ActivityParsed; via: "step" | "related" }[]> = {};
+    for (const a of plan.activities) {
+      const stepCtrls = new Set(a.steps.flatMap((s) => s.controls));
+      const relCtrls = new Set(a.relatedControls);
+      const allCtrls = new Set([...stepCtrls, ...relCtrls]);
+      for (const cid of allCtrls) {
+        if (!map[cid]) map[cid] = [];
+        map[cid].push({ activity: a, via: relCtrls.has(cid) ? "related" : "step" });
+      }
+    }
+    return map;
+  }, [plan.activities]);
+
+  const filteredControls = useMemo(() => {
+    if (!search) return allControls;
+    const q = search.toLowerCase();
+    return allControls.filter((c) => {
+      if (c.toLowerCase().includes(q)) return true;
+      if (catalog) {
+        const ctrl = findCatalogControl(catalog, c);
+        if (ctrl && ctrl.title.toLowerCase().includes(q)) return true;
+      }
+      return false;
+    });
+  }, [allControls, search, catalog]);
+
+  return (
+    <>
+      <BreadcrumbHeader planTitle={plan.title} crumbs={["Controls"]} onHome={onHome} />
+
+      <Card>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+          <IcoShield size={18} style={{ color: colors.purple }} />
+          <h2 style={{ fontSize: 18, fontWeight: 700, color: colors.navy, margin: 0 }}>
+            Addressed Controls ({allControls.length})
+          </h2>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, background: colors.surfaceMuted, borderRadius: 4, padding: "6px 10px", marginBottom: 10 }}>
+          <IcoSearch size={14} style={{ color: colors.gray }} />
+          <input
+            value={search} onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter controls by ID or title..."
+            style={{ border: "none", background: "transparent", outline: "none", flex: 1, fontSize: 13, fontFamily: fonts.sans, color: colors.black }}
+          />
+        </div>
+        {!catalog && (
+          <div style={{
+            padding: "8px 14px", background: colors.surfaceMuted, borderRadius: radii.sm,
+            border: `1px solid ${colors.borderSubtle}`, fontSize: 12, color: colors.gray, fontStyle: "italic",
+          }}>
+            Load a catalog in the Catalog tab to see full control details (title, statement, guidance).
+          </div>
+        )}
+      </Card>
+
+      {filteredControls.map((cid) => {
+        const activities = controlActivityMap[cid] ?? [];
+        const catalogCtrl = catalog ? findCatalogControl(catalog, cid) : null;
+        const lbl = catalogCtrl ? getCatalogLabel(catalogCtrl.props) : "";
+        const isActive = hCtrl === cid;
+
+        return (
+          <ControlEntry
+            key={cid}
+            controlId={cid}
+            label={lbl}
+            title={catalogCtrl?.title}
+            catalog={catalog}
+            activities={activities}
+            isActive={isActive}
+            onCtrl={onCtrl}
+            onSelectActivity={onSelectActivity}
+          />
+        );
+      })}
+
+      {filteredControls.length === 0 && (
+        <div style={{ textAlign: "center", padding: 32, color: colors.gray, fontSize: 13 }}>
+          No controls match your search.
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ── Single control entry in the controls view ── */
+function ControlEntry({ controlId, label, title, catalog, activities, isActive, onCtrl, onSelectActivity }: {
+  controlId: string; label: string; title?: string; catalog: OscalCatalog | null;
+  activities: { activity: ActivityParsed; via: "step" | "related" }[];
+  isActive: boolean; onCtrl: (c: string) => void; onSelectActivity: (uuid: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div style={{
+      background: colors.card, borderRadius: radii.md, marginBottom: 10,
+      border: `1px solid ${isActive ? colors.orange : colors.border}`,
+      boxShadow: isActive ? `0 0 0 1px ${alpha(colors.orange, 13)}` : shadows.sm,
+      overflow: "hidden",
+    }}>
+      {/* Control header */}
+      <div
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 10, padding: "12px 16px",
+          cursor: "pointer", userSelect: "none",
+        }}
+      >
+        <IcoRight size={12} style={{ color: colors.purple, transform: expanded ? "rotate(90deg)" : "rotate(0)", transition: "transform .15s", flexShrink: 0 }} />
+        <ControlBadge control={controlId} active={isActive} onClick={onCtrl} />
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {title && (
+            <span style={{ fontSize: 13, fontWeight: 600, color: colors.black }}>{label ? `${label} ` : ""}{title}</span>
+          )}
+        </div>
+        <span style={{
+          fontSize: 10, fontWeight: 600, fontFamily: fonts.mono, padding: "2px 8px",
+          borderRadius: 3, background: colors.surfaceMuted, color: colors.navy, flexShrink: 0,
+        }}>
+          {activities.length} {activities.length === 1 ? "activity" : "activities"}
+        </span>
+      </div>
+
+      {/* Expanded: catalog detail + assessments */}
+      {expanded && (
+        <div style={{ borderTop: `1px solid ${colors.borderSubtle}`, padding: "12px 16px" }}>
+          {/* Catalog detail */}
+          {catalog && (
+            <ControlDetailPanel controlId={controlId} catalog={catalog} />
+          )}
+
+          {/* Assessing activities */}
+          <div style={{ marginTop: catalog ? 12 : 0 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.08em", color: colors.gray, marginBottom: 8 }}>
+              Assessed by
+            </div>
+            {activities.map(({ activity, via }) => (
+              <div
+                key={activity.uuid}
+                onClick={(e) => { e.stopPropagation(); onSelectActivity(activity.uuid); }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8, padding: "8px 12px",
+                  background: colors.surfaceMuted, borderRadius: radii.sm, marginBottom: 4,
+                  cursor: "pointer", border: `1px solid ${colors.borderSubtle}`,
+                  transition: "border-color 0.12s",
+                }}
+              >
+                <IcoAct size={13} style={{ color: colors.navy, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: colors.navy }}>{activity.title}</div>
+                  <div style={{ fontSize: 10, color: colors.gray, fontFamily: fonts.mono }}>
+                    {activity.steps.length} steps
+                    {via === "related" && (
+                      <span style={{ marginLeft: 6, color: colors.purple, fontWeight: 600 }}>related-control</span>
+                    )}
+                    {via === "step" && (
+                      <span style={{ marginLeft: 6, color: colors.cobalt, fontWeight: 600 }}>
+                        {activity.steps.filter((s) => s.controls.includes(controlId)).length} step{activity.steps.filter((s) => s.controls.includes(controlId)).length !== 1 ? "s" : ""} assess this control
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <IcoRight size={12} style={{ color: colors.gray }} />
+              </div>
+            ))}
+            {activities.length === 0 && (
+              <div style={{ fontSize: 12, color: colors.gray, fontStyle: "italic" }}>
+                No activities reference this control.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
    SIDEBAR NAV ITEM
    ═══════════════════════════════════════════════════════════════════════════ */
 
-function NavItem({ label, sublabel, isActive, stepCount, shallCount, onClick, icon }: {
-  label: string; sublabel?: string; isActive: boolean; stepCount?: number; shallCount?: number;
+function NavItem({ label, sublabel, isActive, stepCount, onClick, icon }: {
+  label: string; sublabel?: string; isActive: boolean; stepCount?: number;
   onClick: () => void; icon: ReactNode;
 }) {
   return (
@@ -835,11 +1288,6 @@ function NavItem({ label, sublabel, isActive, stepCount, shallCount, onClick, ic
           <span style={{ fontSize: 9.5, fontWeight: 600, background: colors.surfaceSubtle, color: colors.navy, padding: "1px 5px", borderRadius: 2, fontFamily: fonts.mono }}>
             {stepCount} steps
           </span>
-          {(shallCount ?? 0) > 0 && (
-            <span style={{ fontSize: 9.5, fontWeight: 600, background: CRIT.SHALL.bg, color: CRIT.SHALL.text, padding: "1px 5px", borderRadius: 2, fontFamily: fonts.mono }}>
-              {shallCount} SHALL
-            </span>
-          )}
         </div>
       )}
     </button>
@@ -850,11 +1298,12 @@ function NavItem({ label, sublabel, isActive, stepCount, shallCount, onClick, ic
    MAIN PAGE COMPONENT
    ═══════════════════════════════════════════════════════════════════════════ */
 
-type PageState = null | { type: "activity"; uuid: string } | { type: "task"; uuid: string };
+type PageState = null | { type: "activity"; uuid: string } | { type: "task"; uuid: string } | { type: "controls" };
 
 export default function AssessmentPlanPage() {
   const oscal = useOscal();
   const raw = oscal.assessmentPlan?.data ?? null;
+  const catalog: OscalCatalog | null = oscal.catalog?.data ?? null;
 
   const [error, setError] = useState("");
   const [hCtrl, setHCtrl] = useState("");
@@ -923,17 +1372,17 @@ export default function AssessmentPlanPage() {
   /* ── Derived data ── */
   const allControls = useMemo(() => {
     if (!plan) return [];
-    return [...new Set(plan.activities.flatMap((a) => a.steps.flatMap((s) => s.controls)))].sort();
+    const stepCtrls = plan.activities.flatMap((a) => a.steps.flatMap((s) => s.controls));
+    const actCtrls = plan.activities.flatMap((a) => a.relatedControls);
+    return [...new Set([...stepCtrls, ...actCtrls])].sort();
   }, [plan]);
 
   const stats = useMemo(() => {
-    if (!plan) return { totalActivities: 0, totalSteps: 0, shallCount: 0, totalControls: 0, totalTasks: 0 };
+    if (!plan) return { totalActivities: 0, totalSteps: 0, totalControls: 0, totalTasks: 0 };
     const totalSteps = plan.activities.reduce((n, a) => n + a.steps.length, 0);
-    const shallCount = plan.activities.reduce((n, a) => n + a.steps.filter((s) => s.criticality === "SHALL").length, 0);
     return {
       totalActivities: plan.activities.length,
       totalSteps,
-      shallCount,
       totalControls: allControls.length,
       totalTasks: plan.tasks.length,
     };
@@ -968,7 +1417,7 @@ export default function AssessmentPlanPage() {
     const q = search.toLowerCase();
     if (!q) return plan.activities;
     return plan.activities.filter(
-      (a) => a.title.toLowerCase().includes(q) || a.steps.some((s) => s.title.toLowerCase().includes(q) || s.controls.some((c) => c.toLowerCase().includes(q))),
+      (a) => a.title.toLowerCase().includes(q) || a.relatedControls.some((c) => c.toLowerCase().includes(q)) || a.steps.some((s) => s.title.toLowerCase().includes(q) || s.controls.some((c) => c.toLowerCase().includes(q))),
     );
   }, [plan, search]);
 
@@ -1016,10 +1465,13 @@ export default function AssessmentPlanPage() {
                 onSelectActivity={(uuid) => navigate({ type: "activity", uuid })} />
             )}
             {page?.type === "activity" && curActivity && (
-              <ActivityView activity={curActivity} planTitle={plan.title} hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)} />
+              <ActivityView activity={curActivity} planTitle={plan.title} hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)} catalog={catalog} />
             )}
             {page?.type === "task" && curTask && (
-              <TaskView task={curTask} planTitle={plan.title} hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)} />
+              <TaskView task={curTask} planTitle={plan.title} hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)} catalog={catalog} />
+            )}
+            {page?.type === "controls" && (
+              <ControlsView plan={plan} allControls={allControls} catalog={catalog} hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)} onSelectActivity={(uuid) => navigate({ type: "activity", uuid })} />
             )}
           </div>
         </div>
@@ -1040,19 +1492,12 @@ export default function AssessmentPlanPage() {
           <div style={{ fontSize: 13, fontWeight: 700, color: colors.navy, fontFamily: fonts.sans, marginBottom: 2 }}>
             {trunc(plan.title, 40)}
           </div>
-          <div style={{ display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 8 }}>
-            {[
-              { v: stats.totalActivities, l: "ACT.", c: colors.navy },
-              { v: stats.totalSteps, l: "STEPS", c: colors.brightBlue },
-              { v: stats.shallCount, l: "SHALL", c: colors.orange },
-              { v: stats.totalControls, l: "CTRL", c: colors.darkGreen },
-              ...(stats.totalTasks > 0 ? [{ v: stats.totalTasks, l: "TASKS", c: colors.purple }] : []),
-            ].map((s) => (
-              <div key={s.l} style={{ textAlign: "center", background: colors.surfaceMuted, borderRadius: 4, padding: "3px 6px", minWidth: 36, flex: 1 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: s.c }}>{s.v}</div>
-                <div style={{ fontSize: 7, fontWeight: 600, color: colors.gray, textTransform: "uppercase", letterSpacing: "0.06em" }}>{s.l}</div>
-              </div>
-            ))}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 12px", fontSize: 10, color: colors.gray, fontFamily: fonts.sans, marginBottom: 6 }}>
+            {plan.version && <span>Version: <strong style={{ color: colors.black }}>{plan.version}</strong></span>}
+            {plan.oscalVersion && <span>OSCAL: <strong style={{ color: colors.black }}>{plan.oscalVersion}</strong></span>}
+            {plan.lastModified && <span>Modified: <strong style={{ color: colors.black }}>{fmtDate(plan.lastModified)}</strong></span>}
+            {plan.published && <span>Published: <strong style={{ color: colors.black }}>{fmtDate(plan.published)}</strong></span>}
+            {plan.parties.length > 0 && <span>Author: <strong style={{ color: colors.black }}>{plan.parties.join(", ")}</strong></span>}
           </div>
 
           {/* Search */}
@@ -1095,7 +1540,6 @@ export default function AssessmentPlanPage() {
               {filteredActivities.map((a) => (
                 <NavItem key={a.uuid} label={a.title} isActive={false}
                   stepCount={a.steps.length}
-                  shallCount={a.steps.filter((s) => s.criticality === "SHALL").length}
                   onClick={() => navigate({ type: "activity", uuid: a.uuid })}
                   icon={<IcoAct size={14} />} />
               ))}
@@ -1108,7 +1552,6 @@ export default function AssessmentPlanPage() {
                   sublabel={[t.type, t.timing].filter(Boolean).join(" · ")}
                   isActive={false}
                   stepCount={t.associatedActivities.reduce((n, a) => n + a.steps.length, 0)}
-                  shallCount={t.associatedActivities.reduce((n, a) => n + a.steps.filter((s) => s.criticality === "SHALL").length, 0)}
                   onClick={() => navigate({ type: "task", uuid: t.uuid })}
                   icon={<IcoTask size={14} />} />
               ))}
@@ -1118,6 +1561,9 @@ export default function AssessmentPlanPage() {
             </>
           )}
         </div>
+
+        {/* Controls nav */}
+        <CtrlPanel allControls={allControls} onClick={() => navigate({ type: "controls" })} isActive={false} />
       </div>
     );
   }
@@ -1143,24 +1589,12 @@ export default function AssessmentPlanPage() {
             <div style={{ fontSize: 13, fontWeight: 700, color: colors.navy, fontFamily: fonts.sans, marginBottom: 2 }}>
               {trunc(plan.title, 40)}
             </div>
-            <div style={{ fontSize: 10, color: colors.gray, fontFamily: fonts.mono, marginBottom: 8 }}>
-              {plan.version && `v${plan.version}`}{plan.oscalVersion ? `  OSCAL ${plan.oscalVersion}` : ""}
-            </div>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
-              {[
-                { v: stats.totalActivities, l: "ACT.", c: colors.navy },
-                { v: stats.totalSteps, l: "STEPS", c: colors.brightBlue },
-                { v: stats.shallCount, l: "SHALL", c: colors.orange },
-                { v: stats.totalControls, l: "CTRL", c: colors.darkGreen },
-                ...(stats.totalTasks > 0 ? [{ v: stats.totalTasks, l: "TASKS", c: colors.purple }] : []),
-              ].map((s) => (
-                <div key={s.l} style={{
-                  textAlign: "center", background: colors.surfaceMuted, borderRadius: 4, padding: "4px 8px", minWidth: 40, flex: 1,
-                }}>
-                  <div style={{ fontSize: 16, fontWeight: 700, color: s.c }}>{s.v}</div>
-                  <div style={{ fontSize: 8, fontWeight: 600, color: colors.gray, textTransform: "uppercase", letterSpacing: "0.06em" }}>{s.l}</div>
-                </div>
-              ))}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "2px 12px", fontSize: 10, color: colors.gray, fontFamily: fonts.sans, marginBottom: 6 }}>
+              {plan.version && <span>Version: <strong style={{ color: colors.black }}>{plan.version}</strong></span>}
+              {plan.oscalVersion && <span>OSCAL: <strong style={{ color: colors.black }}>{plan.oscalVersion}</strong></span>}
+              {plan.lastModified && <span>Modified: <strong style={{ color: colors.black }}>{fmtDate(plan.lastModified)}</strong></span>}
+              {plan.published && <span>Published: <strong style={{ color: colors.black }}>{fmtDate(plan.published)}</strong></span>}
+              {plan.parties.length > 0 && <span>Author: <strong style={{ color: colors.black }}>{plan.parties.join(", ")}</strong></span>}
             </div>
 
             {/* Search */}
@@ -1226,7 +1660,6 @@ export default function AssessmentPlanPage() {
                     label={a.title}
                     isActive={page?.type === "activity" && page.uuid === a.uuid}
                     stepCount={a.steps.length}
-                    shallCount={a.steps.filter((s) => s.criticality === "SHALL").length}
                     onClick={() => navigate({ type: "activity", uuid: a.uuid })}
                     icon={<IcoAct size={14} />}
                   />
@@ -1242,7 +1675,6 @@ export default function AssessmentPlanPage() {
                     sublabel={[t.type, t.timing].filter(Boolean).join(" · ")}
                     isActive={page?.type === "task" && page.uuid === t.uuid}
                     stepCount={t.associatedActivities.reduce((n, a) => n + a.steps.length, 0)}
-                    shallCount={t.associatedActivities.reduce((n, a) => n + a.steps.filter((s) => s.criticality === "SHALL").length, 0)}
                     onClick={() => navigate({ type: "task", uuid: t.uuid })}
                     icon={<IcoTask size={14} />}
                   />
@@ -1257,7 +1689,7 @@ export default function AssessmentPlanPage() {
           </div>
 
           {/* Controls panel */}
-          <CtrlPanel allControls={allControls} hCtrl={hCtrl} onCtrl={onCtrl} />
+          <CtrlPanel allControls={allControls} onClick={() => navigate({ type: "controls" })} isActive={page?.type === "controls"} />
         </nav>
 
         {/* CONTENT */}
@@ -1273,12 +1705,21 @@ export default function AssessmentPlanPage() {
             <ActivityView
               activity={curActivity} planTitle={plan.title}
               hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)}
+              catalog={catalog}
             />
           )}
           {page?.type === "task" && curTask && (
             <TaskView
               task={curTask} planTitle={plan.title}
               hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)}
+              catalog={catalog}
+            />
+          )}
+          {page?.type === "controls" && (
+            <ControlsView
+              plan={plan} allControls={allControls} catalog={catalog}
+              hCtrl={hCtrl} onCtrl={onCtrl} onHome={() => navigate(null)}
+              onSelectActivity={(uuid) => navigate({ type: "activity", uuid })}
             />
           )}
         </div>
